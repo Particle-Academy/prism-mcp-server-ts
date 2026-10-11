@@ -240,6 +240,12 @@ describe('handlers, gates, caps and protocol errors', () => {
 });
 
 describe('in-memory lifecycle without a timeout', () => {
+  it('reports no credential as null', async () => {
+    const transport = new InMemoryTransport();
+    const server = new Server({ server: 'fixture', transport });
+    expect(await server.listen()).toEqual({ url: 'memory://prism-mcp-server', token: null });
+    await server.close();
+  });
   it('holds a request beyond Node defaults using a virtual clock and completes', async () => {
     vi.useFakeTimers();
     const { server, transport } = await setup();

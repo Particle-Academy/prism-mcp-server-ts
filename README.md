@@ -56,7 +56,7 @@ results use `{ content: [{ type: 'text', text }], isError }`; failures throw
 shared `McpError` for the transport to map. Handler exception diagnostics are
 not exposed; their shared error category is retained.
 
-In-memory `listen()` returns a `memory://` identifier and empty token; these
+In-memory `listen()` returns a `memory://` identifier and `token: null`; these
 are not HTTP credentials or a dialable URL. Requests have no fixed timeout.
 `close()` releases pending request waiters immediately, rejects further work
 and is idempotent. JavaScript promises cannot forcibly stop application code;

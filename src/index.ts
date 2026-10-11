@@ -27,7 +27,7 @@ export type ToolHandler = (
 ) => McpToolResult | Promise<McpToolResult>;
 
 export interface ServerTransport {
-  listen(handler: (request: TransportRequest) => Promise<JsonValue>): Promise<{ url: string; token: string }>;
+  listen(handler: (request: TransportRequest) => Promise<JsonValue>): Promise<{ url: string; token: string | null }>;
   close(): Promise<void>;
 }
 
@@ -83,7 +83,7 @@ export class Server {
     this.#tools.set(snapshot.name, { definition: snapshot, handler, mirrored });
   }
 
-  listen(): Promise<{ url: string; token: string }> {
+  listen(): Promise<{ url: string; token: string | null }> {
     this.#assertOpen();
     return this.options.transport.listen((request) => this.handle(request));
   }
@@ -224,10 +224,10 @@ export class InMemoryTransport implements ServerTransport {
   #closed = false;
   readonly #pending = new Set<(error: McpError) => void>();
 
-  async listen(handler: (request: TransportRequest) => Promise<JsonValue>): Promise<{ url: string; token: string }> {
+  async listen(handler: (request: TransportRequest) => Promise<JsonValue>): Promise<{ url: string; token: string | null }> {
     if (this.#closed || this.#handler) throw new McpError('protocol_failure', 'Transport is closed or already listening.');
     this.#handler = handler;
-    return { url: 'memory://prism-mcp-server', token: '' };
+    return { url: 'memory://prism-mcp-server', token: null };
   }
 
   readonly request = (request: TransportRequest): Promise<JsonValue> => {
