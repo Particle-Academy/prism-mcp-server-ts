@@ -1,0 +1,23 @@
+{
+  "name": "@particle-academy/prism-mcp-server",
+  "version": "0.1.0",
+  "description": "Transport-independent MCP tool serving for the Prism ecosystem.",
+  "type": "module",
+  "sideEffects": false,
+  "license": "MIT",
+  "engines": { "node": ">=22" },
+  "exports": { ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" } },
+  "files": ["dist", "LICENSE", "README.md"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json",
+    "test": "vitest run"
+  },
+  "dependencies": { "@particle-academy/prism-mcp": "0.3.0" },
+  "devDependencies": {
+    "@types/node": "^26.3.0",
+    "typescript": "^5.9.3",
+    "vitest": "4.1.11",
+    "@modelcontextprotocol/sdk": "1.32.1"
+  }
+}
