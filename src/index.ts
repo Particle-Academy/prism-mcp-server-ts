@@ -20,6 +20,7 @@ import {
 export { TrustPolicy } from '@particle-academy/prism-mcp';
 export { McpError, MirroredParameters, ResultGuard, ToolDefinition, allowAll };
 export type { JsonObject, JsonValue, McpErrorCode, McpToolResult, ToolGate, TransportRequest };
+export { LoopbackHttpTransport, type LoopbackHttpOptions } from './http.js';
 
 export type ToolHandler = (
   args: JsonObject,

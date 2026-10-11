@@ -1,8 +1,8 @@
 # @particle-academy/prism-mcp-server
 
-Phase 1: stateless MCP tool registration and dispatch over a consumer-supplied
-`ServerTransport`, with an in-memory implementation. Node 22+, ESM. No HTTP
-listener, sockets, stdio, handshake, sessions, push, resources or prompts.
+Stateless MCP tool registration and dispatch over a consumer-supplied
+`ServerTransport`, with in-memory and authenticated loopback HTTP implementations.
+Node 22+, ESM. No stdio, handshake, sessions, push, resources or prompts.
 
 The sole runtime dependency is `@particle-academy/prism-mcp`; there are **zero
 third-party runtime dependencies**. Shared definitions, errors, gates and guards
@@ -61,8 +61,50 @@ are not HTTP credentials or a dialable URL. Requests have no fixed timeout.
 `close()` releases pending request waiters immediately, rejects further work
 and is idempotent. JavaScript promises cannot forcibly stop application code;
 the embedder remains responsible for its handler-owned background work.
-Phase 2 will implement loopback binding, Origin checks and bearer authorization;
-phase 3 will add SDK conformance and consumer acceptance tests.
+SDK conformance and consumer acceptance remain phase 3.
+
+For HTTP, replace the transport with `new LoopbackHttpTransport()`:
+
+```ts
+import { LoopbackHttpTransport, Server } from '@particle-academy/prism-mcp-server';
+
+const transport = new LoopbackHttpTransport();
+const server = new Server({ server: 'example', transport });
+// Register application tools, then start the listener.
+const { url, token } = await server.listen();
+// Give both values privately to the client. Each POST needs:
+// Authorization: Bearer <token>, Content-Type: application/json
+// Send a JSON-RPC 2.0 request with id, method and the per-request params._meta above.
+// await server.close() when the embedder shuts down.
+```
+
+The HTTP URL is `http://127.0.0.1:<port>/mcp`. `port` defaults to `0` (an OS-chosen
+port); the bind address is fixed to literal `127.0.0.1`. `token` is generated at
+startup from 32 cryptographically random bytes, or may be supplied in the options.
+Configured tokens must be non-empty bearer-token strings; whitespace is refused
+before listening. HTTP always returns a real token; only memory returns `null`.
+The URL alone does not authorize a client. Keep the token out of URLs and logs.
+Every request requires `Authorization: Bearer <token>`; comparison uses fixed-size
+SHA-256 digests and `timingSafeEqual`.
+
+Requests without `Origin` may proceed with valid credentials. A browser `Origin`
+must exactly match the listener's own origin by default. `allowedOrigins` replaces
+that allow-list with explicit `http://127.0.0.1:<port>` / `https://[::1]:<port>`
+origins (either scheme is supported); arbitrary hostnames, paths, wildcard origins
+and non-loopback addresses are refused at startup. No browser CORS/preflight
+support is provided. GET, upgrades, CONNECT and SSE-only requests are refused;
+an Accept header offering both JSON and SSE receives JSON.
+
+POSTs require `Content-Length` and JSON content; chunked uploads, batches,
+notifications and ambiguous duplicate headers are refused. `maxRequestBytes`
+defaults to 1 MiB. Responses carry the same request id and either `result` or a
+JSON-RPC `error` with the shared Prism category in `error.data.code`; arbitrary
+diagnostic messages are withheld. HTTP refusal uses 401 for credentials and 403
+for Origin. No request, header or socket deadline is imposed. `close()` releases
+every socket, including incomplete HTTP headers and held long-polls, before
+resolving; handler-owned application work still needs embedder cleanup.
 
 Local gates: `npm run typecheck`, `npm run build`, `npm test`. Test sources are
 typechecked too. No remote, publishing workflow or tag is configured here.
+The complete suite includes a real 310-second HTTP long-poll and takes about
+six minutes. SDK reference-client conformance is not part of this phase.
