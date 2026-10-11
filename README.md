@@ -46,13 +46,22 @@ before gating; nested string/integer/boolean fields are supported. Ambiguous
 headers, invalid primitive encodings and conflicting body/header values fail
 closed. Handlers validate the rest of their own application arguments.
 
-Every request requires `params._meta` with
+`tools/list` and `tools/call` require `params._meta` with
 `io.modelcontextprotocol/protocolVersion: '2026-07-28'`,
-`io.modelcontextprotocol/clientCapabilities: {}` and
-`io.modelcontextprotocol/clientInfo: { name: 'example', version: '1' }`.
+`io.modelcontextprotocol/clientCapabilities: {}`.
+`io.modelcontextprotocol/clientInfo: { name: 'example', version: '1' }` is optional.
 Older revisions fail with shared `unsupported_protocol_version`, naming both
-revisions. Only `tools/list` and `tools/call` are dispatched. Successful wire
-results use `{ content: [{ type: 'text', text }], isError }`; failures throw
+revisions. `server/discover`, `tools/list` and `tools/call` are dispatched.
+Discovery advertises `supportedVersions: ['2026-07-28']` and `capabilities: { tools: {} }`
+regardless of the probe's requested version, including absent, older or unknown
+versions. The probe needs no `params`, `_meta`, capabilities or client identity,
+creates no session, and does not change server state. It uses the same
+HTTP bearer and Origin checks as tool requests. Every successful result includes
+`resultType: 'complete'` and `_meta['io.modelcontextprotocol/serverInfo']` identifying
+the serving software as `{ name: '@particle-academy/prism-mcp-server', version: '0.1.0' }`.
+Discovery and tool lists include `ttlMs: 0, cacheScope: 'private'`; callers re-fetch
+to observe registration changes. Tool call results also carry
+`{ content: [{ type: 'text', text }], isError }`; failures throw
 shared `McpError` for the transport to map. Handler exception diagnostics are
 not exposed; their shared error category is retained.
 

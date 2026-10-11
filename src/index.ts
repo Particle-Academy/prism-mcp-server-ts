@@ -42,6 +42,7 @@ export interface ServerOptions {
 const VERSION = 'io.modelcontextprotocol/protocolVersion';
 const CAPABILITIES = 'io.modelcontextprotocol/clientCapabilities';
 const CLIENT_INFO = 'io.modelcontextprotocol/clientInfo';
+const SERVER_INFO = 'io.modelcontextprotocol/serverInfo';
 const PREFIX = 'mcp-param-';
 
 interface RegisteredTool {
@@ -96,13 +97,20 @@ export class Server {
 
   async handle(request: TransportRequest): Promise<JsonValue> {
     this.#assertOpen();
+    // Discovery precedes version selection: it cannot require the metadata of
+    // an agreed revision. HTTP bearer/Origin checks still run in the transport.
+    if (request.method === 'server/discover') {
+      return complete({ supportedVersions: [LATEST_PROTOCOL_VERSION], capabilities: { tools: {} },
+        ttlMs: 0, cacheScope: 'private' });
+    }
     const params = request.params ?? {};
     assertProtocol(params);
     if (request.method === 'tools/list') {
-      return { tools: [...this.#tools.values()].map(({ definition }) => payloadOf(definition)) };
+      return complete({ tools: [...this.#tools.values()].map(({ definition }) => payloadOf(definition)),
+        ttlMs: 0, cacheScope: 'private' });
     }
     if (request.method !== 'tools/call') {
-      throw new McpError('protocol_failure', 'Only tools/list and tools/call are supported; no initialize handshake.');
+      throw new McpError('protocol_failure', 'Only server/discover, tools/list and tools/call are supported; no initialize handshake.');
     }
     if (typeof params.name !== 'string' || params.name === '') {
       throw new McpError('protocol_failure', 'tools/call requires a tool name.');
@@ -135,7 +143,7 @@ export class Server {
       throw new McpError('protocol_failure', 'The handler must return McpToolResult.');
     }
     const text = this.#guard.guard(this.options.server, tool.definition.name, result.text);
-    return { content: [{ type: 'text', text }], isError: result.isError };
+    return complete({ content: [{ type: 'text', text }], isError: result.isError });
   }
 
   #assertOpen(): void {
@@ -153,9 +161,20 @@ function assertProtocol(params: JsonObject): void {
     throw new McpError('unsupported_protocol_version',
       `Protocol ${known ? 'revision' : 'version'} [${typeof version === 'string' ? version : 'missing'}] is unsupported; expected [${LATEST_PROTOCOL_VERSION}].`);
   }
-  if (!isJsonObject(params._meta[CAPABILITIES]) || !isJsonObject(params._meta[CLIENT_INFO])) {
-    throw new McpError('protocol_failure', 'Requests require client capabilities and client info in _meta.');
+  if (!isJsonObject(params._meta[CAPABILITIES])) {
+    throw new McpError('protocol_failure', 'Requests require client capabilities in _meta.');
   }
+  if (Object.hasOwn(params._meta, CLIENT_INFO) && !isJsonObject(params._meta[CLIENT_INFO])) {
+    throw new McpError('protocol_failure', 'Client info must be an object when supplied.');
+  }
+}
+
+function complete(result: JsonObject): JsonObject {
+  // Identify the serving software, independently of the embedder's gate/context
+  // label. Fresh objects prevent callers from mutating subsequent responses.
+  return { ...result, resultType: 'complete', _meta: {
+    [SERVER_INFO]: { name: '@particle-academy/prism-mcp-server', version: '0.1.0' },
+  } };
 }
 
 function cloneObject(value: JsonObject): JsonObject {

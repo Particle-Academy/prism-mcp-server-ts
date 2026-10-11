@@ -13,6 +13,9 @@ import {
 const VERSION = 'io.modelcontextprotocol/protocolVersion';
 const CAPABILITIES = 'io.modelcontextprotocol/clientCapabilities';
 const CLIENT_INFO = 'io.modelcontextprotocol/clientInfo';
+const RESULT_META = { resultType: 'complete', _meta: {
+  'io.modelcontextprotocol/serverInfo': { name: '@particle-academy/prism-mcp-server', version: '0.1.0' },
+} };
 
 function request(method = 'tools/list', params: JsonObject = {}, headers: Record<string, string> = {}): TransportRequest {
   return { method, params: { ...params, _meta: {
@@ -67,7 +70,7 @@ describe('shared definitions and registration', () => {
     const second = await transport.request(request()) as { tools: JsonObject[] };
     expect(ToolDefinition.fromPayload(second.tools[0]).digest()).toBe(digest);
     expect(await transport.request(request('tools/call', { name: 'echo' }, { 'Mcp-Param-region': 'east' })))
-      .toEqual({ content: [{ type: 'text', text: '{"region":"east"}' }], isError: false });
+      .toEqual({ content: [{ type: 'text', text: '{"region":"east"}' }], isError: false, ...RESULT_META });
     await server.close();
   });
   it('refuses duplicate registration without replacing the original handler', async () => {
@@ -75,7 +78,7 @@ describe('shared definitions and registration', () => {
     server.register(definition(), () => ({ text: 'original', isError: false }));
     expect(() => server.register(definition(), echo)).toThrow(McpError);
     expect(await transport.request(request('tools/call', { name: 'echo' })))
-      .toEqual({ content: [{ type: 'text', text: 'original' }], isError: false });
+      .toEqual({ content: [{ type: 'text', text: 'original' }], isError: false, ...RESULT_META });
     await server.close();
   });
   const illegal: JsonObject[] = [
@@ -137,7 +140,7 @@ describe('mirrored headers and the credential boundary', () => {
     }));
     expect(gate).toHaveBeenCalledWith('fixture', 'nested', { other: 'untouched', options: { region: 'east', count: 0, enabled: false } });
     expect(args).toEqual({ other: 'untouched' });
-    expect(reply).toEqual({ content: [{ type: 'text', text: '{"other":"untouched","options":{"region":"east","count":0,"enabled":false}}' }], isError: false });
+    expect(reply).toEqual({ content: [{ type: 'text', text: '{"other":"untouched","options":{"region":"east","count":0,"enabled":false}}' }], isError: false, ...RESULT_META });
     await server.close();
   });
   it.each(['1.5', '01', '+1', '9007199254740992', 'false'])('rejects malformed mirrored integer %s', async (value) => {
@@ -207,7 +210,7 @@ describe('handlers, gates, caps and protocol errors', () => {
     const { server, transport } = await setup({ guard: new ResultGuard({ maxBytes: 4, frameProvenance: false }) });
     server.register(definition(), (args) => ({ text: String(args.text), isError: false }));
     expect(await transport.request(request('tools/call', { name: 'echo', arguments: { text: '😀' } })))
-      .toEqual({ content: [{ type: 'text', text: '😀' }], isError: false });
+      .toEqual({ content: [{ type: 'text', text: '😀' }], isError: false, ...RESULT_META });
     await expect(transport.request(request('tools/call', { name: 'echo', arguments: { text: '😀😀' } })))
       .rejects.toMatchObject({ code: 'result_too_large' });
     await server.close();
@@ -262,7 +265,7 @@ describe('in-memory lifecycle without a timeout', () => {
     expect(started).toHaveBeenCalledOnce();
     expect(settled).toBe(false);
     finish({ text: 'long-poll-complete', isError: false });
-    expect(await pending).toEqual({ content: [{ type: 'text', text: 'long-poll-complete' }], isError: false });
+    expect(await pending).toEqual({ content: [{ type: 'text', text: 'long-poll-complete' }], isError: false, ...RESULT_META });
     await server.close();
   });
   it('closes with long-polls in flight and refuses later work', async () => {

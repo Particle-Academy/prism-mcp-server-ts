@@ -26,7 +26,7 @@ async function setup(options: ConstructorParameters<typeof LoopbackHttpTransport
   return { server, transport, url: endpoint.url, token: endpoint.token as string };
 }
 
-function send(url: string, token?: string, headers: http.OutgoingHttpHeaders = {}, body: unknown = rpc(), method = 'POST', deadline = 3000): Promise<{ status: number; body: JsonObject }> {
+function send(url: string, token?: string, headers: http.OutgoingHttpHeaders = {}, body: unknown = rpc(), method = 'POST', deadline = 3000): Promise<{ status: number; body: JsonObject; headers: http.IncomingHttpHeaders }> {
   const data = JSON.stringify(body);
   return new Promise((resolve, reject) => {
     const request = http.request(url, { method, agent: false, headers: { 'Content-Type': 'application/json',
@@ -34,16 +34,70 @@ function send(url: string, token?: string, headers: http.OutgoingHttpHeaders = {
       let text = '';
       response.setEncoding('utf8');
       response.on('data', (chunk: string) => { text += chunk; });
-      response.once('end', () => resolve({ status: response.statusCode!, body: text ? JSON.parse(text) as JsonObject : {} }));
+      response.once('end', () => resolve({ status: response.statusCode!, body: text ? JSON.parse(text) as JsonObject : {}, headers: response.headers }));
       response.once('error', reject);
     });
     const expiry = setTimeout(() => request.destroy(new Error('Test request exceeded deadline.')), deadline);
     request.once('close', () => clearTimeout(expiry));
-    request.once('connect', (response, socket) => { socket.destroy(); resolve({ status: response.statusCode!, body: {} }); });
+    request.once('connect', (response, socket) => { socket.destroy(); resolve({ status: response.statusCode!, body: {}, headers: response.headers }); });
     request.once('error', reject);
     request.end(data);
   });
 }
+
+it.each(['tools/list', 'tools/call'])('serves %s without clientInfo over HTTP while preserving security checks', async (method) => {
+  const { server, url, token } = await setup();
+  const handler = vi.fn(() => ({ text: 'served', isError: false }));
+  server.register(new ToolDefinition('echo', '', {}), handler);
+  const body = rpc(method, method === 'tools/call' ? { name: 'echo' } : {});
+  const meta = (body.params as JsonObject)._meta as JsonObject;
+  delete meta['io.modelcontextprotocol/clientInfo'];
+  for (const candidate of [undefined, '', `${token[0] === 'a' ? 'b' : 'a'}${token.slice(1)}`]) {
+    expect((await send(url, candidate, {}, body)).status).toBe(401);
+  }
+  expect((await send(url, token, { Origin: 'https://attacker.example' }, body)).status).toBe(403);
+  for (const version of [undefined, 'wrong', '2025-11-25']) {
+    if (version === undefined) delete meta['io.modelcontextprotocol/protocolVersion'];
+    else meta['io.modelcontextprotocol/protocolVersion'] = version;
+    expect((await send(url, token, {}, body)).body.error).toMatchObject({ data: { code: 'unsupported_protocol_version' } });
+  }
+  meta['io.modelcontextprotocol/protocolVersion'] = LATEST_PROTOCOL_VERSION;
+  delete meta['io.modelcontextprotocol/clientCapabilities'];
+  expect((await send(url, token, {}, body)).body.error).toMatchObject({ data: { code: 'protocol_failure' } });
+  meta['io.modelcontextprotocol/clientCapabilities'] = {};
+  expect(handler).not.toHaveBeenCalled();
+  const reply = await send(url, token, { Origin: new URL(url).origin }, body);
+  expect(reply.status).toBe(200);
+  expect(reply.headers).not.toHaveProperty('mcp-session-id');
+  expect(reply.body.result).toMatchObject({ resultType: 'complete', _meta: {
+    'io.modelcontextprotocol/serverInfo': { name: '@particle-academy/prism-mcp-server', version: '0.1.0' },
+  } });
+  if (method === 'tools/list') expect((reply.body.result as JsonObject).tools).toHaveLength(1);
+  else { expect((reply.body.result as JsonObject).content).toEqual([{ type: 'text', text: 'served' }]); expect(handler).toHaveBeenCalledOnce(); }
+});
+
+it.each([
+  ['no params', undefined], ['empty params', {}], ['no _meta', { name: 'ignored' }],
+  ['empty _meta', { _meta: {} }],
+  ['older version', { _meta: { 'io.modelcontextprotocol/protocolVersion': '2025-11-25' } }],
+  ['unknown version', { _meta: { 'io.modelcontextprotocol/protocolVersion': 'unknown' } }],
+  ['no capabilities', { _meta: { 'io.modelcontextprotocol/protocolVersion': LATEST_PROTOCOL_VERSION } }],
+] as const)('answers HTTP discovery before negotiation while requiring bearer and Origin: %s', async (_name, params) => {
+  const { url, token } = await setup();
+  const body = { jsonrpc: '2.0', id: 'probe', method: 'server/discover', ...(params === undefined ? {} : { params }) };
+  const different = `${token[0] === 'a' ? 'b' : 'a'}${token.slice(1)}`;
+  for (const candidate of [undefined, '', 'wrong', different]) expect((await send(url, candidate, {}, body)).status).toBe(401);
+  expect((await send(url, token, { Origin: 'https://attacker.example' }, body)).status).toBe(403);
+  const reply = await send(url, token, { Origin: new URL(url).origin }, body);
+  expect(reply.status).toBe(200);
+  expect(reply.headers).not.toHaveProperty('mcp-session-id');
+  expect(reply.body).toEqual({ jsonrpc: '2.0', id: 'probe', result: {
+    resultType: 'complete', supportedVersions: ['2026-07-28'], capabilities: { tools: {} },
+    ttlMs: 0, cacheScope: 'private', _meta: {
+      'io.modelcontextprotocol/serverInfo': { name: '@particle-academy/prism-mcp-server', version: '0.1.0' },
+    },
+  } });
+});
 
 it('binds literal 127.0.0.1 and is unreachable on every non-loopback IPv4 interface', async () => {
   const listen = vi.spyOn(http.Server.prototype, 'listen');
