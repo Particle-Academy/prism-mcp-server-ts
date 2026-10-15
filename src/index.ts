@@ -44,6 +44,14 @@ const CAPABILITIES = 'io.modelcontextprotocol/clientCapabilities';
 const CLIENT_INFO = 'io.modelcontextprotocol/clientInfo';
 const SERVER_INFO = 'io.modelcontextprotocol/serverInfo';
 const PREFIX = 'mcp-param-';
+const SERVER_NAME = '@particle-academy/prism-mcp-server';
+const SERVER_VERSION = '0.2.0';
+
+// The handshake revisions, served for clients that open with `initialize`
+// (Codex's MCP client always does: prism-mcp-server-ts#1). Newest first; an
+// unknown requested revision is answered with the first, as the spec says.
+const CLASSIC_VERSIONS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'] as const;
+const STATELESS_KEYS = [VERSION, CAPABILITIES, CLIENT_INFO];
 
 interface RegisteredTool {
   definition: ToolDefinition;
@@ -104,14 +112,51 @@ export class Server {
         ttlMs: 0, cacheScope: 'private' });
     }
     const params = request.params ?? {};
+    // A request carrying ANY stateless metadata key is a stateless request and
+    // is held to the stateless rules; only one with none of them is classic. A
+    // half-formed stateless request must not fall through to the classic path.
+    const classic = !(isJsonObject(params._meta) && STATELESS_KEYS.some((key) => Object.hasOwn(params._meta as JsonObject, key)));
+    if (classic) return this.#classic(request, params);
     assertProtocol(params);
     if (request.method === 'tools/list') {
-      return complete({ tools: [...this.#tools.values()].map(({ definition }) => payloadOf(definition)),
-        ttlMs: 0, cacheScope: 'private' });
+      return complete({ tools: this.#listed(), ttlMs: 0, cacheScope: 'private' });
     }
     if (request.method !== 'tools/call') {
-      throw new McpError('protocol_failure', 'Only server/discover, tools/list and tools/call are supported; no initialize handshake.');
+      throw new McpError('protocol_failure', 'Only server/discover, tools/list and tools/call are supported on the stateless revision.');
     }
+    return complete(await this.#call(request, params));
+  }
+
+  /**
+   * The handshake protocol, for clients that open with `initialize`. Stateless
+   * per request, which the streamable-HTTP transport permits: no session id is
+   * issued, so nothing is bound to one. Authentication is the transport's, and
+   * the registry, gate, mirrors and result guard are the stateless path's own.
+   */
+  async #classic(request: TransportRequest, params: JsonObject): Promise<JsonValue> {
+    if (request.method.startsWith('notifications/')) return null;
+    if (request.method === 'initialize') return initialize(params);
+    const header = request.headers?.['mcp-protocol-version'];
+    if (header !== undefined && !CLASSIC_VERSIONS.some((version) => version === header)) {
+      throw new McpError('unsupported_protocol_version',
+        `Protocol version [${header}] is not served on the handshake path; expected one of [${CLASSIC_VERSIONS.join(', ')}].`);
+    }
+    if (request.method === 'ping') return {};
+    // The spec types title as an optional string, so a null is omitted rather
+    // than sent to a client that may deserialize strictly. The stateless payload
+    // is untouched: tool digests are computed over it.
+    if (request.method === 'tools/list') {
+      return { tools: this.#listed().map((tool) => Object.fromEntries(Object.entries(tool).filter(([, value]) => value !== null))) };
+    }
+    if (request.method === 'tools/call') return this.#call(request, params);
+    throw new McpError('protocol_failure', 'Only initialize, ping, tools/list and tools/call are supported.');
+  }
+
+  #listed(): JsonObject[] {
+    return [...this.#tools.values()].map(({ definition }) => payloadOf(definition));
+  }
+
+  async #call(request: TransportRequest, params: JsonObject): Promise<JsonObject> {
     if (typeof params.name !== 'string' || params.name === '') {
       throw new McpError('protocol_failure', 'tools/call requires a tool name.');
     }
@@ -143,7 +188,7 @@ export class Server {
       throw new McpError('protocol_failure', 'The handler must return McpToolResult.');
     }
     const text = this.#guard.guard(this.options.server, tool.definition.name, result.text);
-    return complete({ content: [{ type: 'text', text }], isError: result.isError });
+    return { content: [{ type: 'text', text }], isError: result.isError };
   }
 
   #assertOpen(): void {
@@ -169,11 +214,22 @@ function assertProtocol(params: JsonObject): void {
   }
 }
 
+function initialize(params: JsonObject): JsonObject {
+  if (typeof params.protocolVersion !== 'string'
+    || (params.capabilities !== undefined && !isJsonObject(params.capabilities))
+    || (params.clientInfo !== undefined && !isJsonObject(params.clientInfo))) {
+    throw new McpError('protocol_failure', 'initialize requires a protocolVersion, and object capabilities and clientInfo.');
+  }
+  const requested = params.protocolVersion;
+  const protocolVersion = CLASSIC_VERSIONS.find((version) => version === requested) ?? CLASSIC_VERSIONS[0];
+  return { protocolVersion, capabilities: { tools: {} }, serverInfo: { name: SERVER_NAME, version: SERVER_VERSION } };
+}
+
 function complete(result: JsonObject): JsonObject {
   // Identify the serving software, independently of the embedder's gate/context
   // label. Fresh objects prevent callers from mutating subsequent responses.
   return { ...result, resultType: 'complete', _meta: {
-    [SERVER_INFO]: { name: '@particle-academy/prism-mcp-server', version: '0.1.0' },
+    [SERVER_INFO]: { name: SERVER_NAME, version: SERVER_VERSION },
   } };
 }
 

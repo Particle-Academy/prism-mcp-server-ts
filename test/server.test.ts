@@ -14,7 +14,7 @@ const VERSION = 'io.modelcontextprotocol/protocolVersion';
 const CAPABILITIES = 'io.modelcontextprotocol/clientCapabilities';
 const CLIENT_INFO = 'io.modelcontextprotocol/clientInfo';
 const RESULT_META = { resultType: 'complete', _meta: {
-  'io.modelcontextprotocol/serverInfo': { name: '@particle-academy/prism-mcp-server', version: '0.1.0' },
+  'io.modelcontextprotocol/serverInfo': { name: '@particle-academy/prism-mcp-server', version: '0.2.0' },
 } };
 
 function request(method = 'tools/list', params: JsonObject = {}, headers: Record<string, string> = {}): TransportRequest {
@@ -226,7 +226,10 @@ describe('handlers, gates, caps and protocol errors', () => {
   it('refuses missing metadata, malformed arguments, unknown methods and unknown tools', async () => {
     const { server, transport } = await setup();
     server.register(definition(), echo);
-    await expect(transport.request({ method: 'tools/list' })).rejects.toMatchObject({ code: 'protocol_failure' });
+    // A request with no stateless metadata is the handshake protocol, served
+    // since prism-mcp-server-ts#1, not refused. A stateless one still cannot
+    // initialize: that revision has no handshake.
+    await expect(transport.request({ method: 'tools/list' })).resolves.toMatchObject({ tools: [{ name: 'echo' }] });
     await expect(transport.request(request('initialize'))).rejects.toMatchObject({ code: 'protocol_failure' });
     await expect(transport.request(request('resources/list'))).rejects.toMatchObject({ code: 'protocol_failure' });
     await expect(transport.request(request('tools/call', { name: 'missing' }))).rejects.toMatchObject({ code: 'tool_call_failed' });

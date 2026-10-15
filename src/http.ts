@@ -25,7 +25,7 @@ function digest(token: string): Buffer {
   return crypto.createHash('sha256').update(token, 'utf8').digest();
 }
 
-/** POST-only, stateless JSON-RPC on a literal IPv4 loopback address. */
+/** POST-only JSON-RPC on a literal IPv4 loopback address. No session is issued on either protocol. */
 export class LoopbackHttpTransport implements ServerTransport {
   readonly #port: number;
   readonly #configuredToken?: string;
@@ -156,18 +156,31 @@ export class LoopbackHttpTransport implements ServerTransport {
     let body: unknown;
     try { body = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks))); }
     catch { send(response, 400, rpcError(null, -32700)); return; }
+    // A notification carries no id and gets no result; only `notifications/*`
+    // methods may omit it (the classic `notifications/initialized` does).
+    const notification = isJsonObject(body) && !Object.hasOwn(body, 'id')
+      && typeof body.method === 'string' && body.method.startsWith('notifications/');
     if (!isJsonObject(body) || body.jsonrpc !== '2.0'
-      || !(typeof body.id === 'string' || (typeof body.id === 'number' && Number.isFinite(body.id)))
+      || !(notification || typeof body.id === 'string' || (typeof body.id === 'number' && Number.isFinite(body.id)))
       || typeof body.method !== 'string' || (body.params !== undefined && !isJsonObject(body.params))) {
       send(response, 400, rpcError(null, -32600)); return;
     }
     if (this.#closed || response.destroyed) return;
+    if (notification) {
+      // Streamable HTTP answers an accepted notification 202 with no body.
+      try { await handler({ method: body.method, params: body.params, headers }); }
+      catch { if (!this.#closed && !response.destroyed) send(response, 400, rpcError(null, -32600)); return; }
+      if (!this.#closed && !response.destroyed) accepted(response);
+      return;
+    }
+    // Validated above: every message that is not a notification has one.
+    const id = body.id as string | number;
     try {
       const result = await handler({ method: body.method, params: body.params, headers });
-      if (!this.#closed && !response.destroyed) send(response, 200, { jsonrpc: '2.0', id: body.id, result });
+      if (!this.#closed && !response.destroyed) send(response, 200, { jsonrpc: '2.0', id, result });
     } catch (error) {
       if (!this.#closed && !response.destroyed) {
-        send(response, 200, rpcError(body.id, -32000, error instanceof McpError ? error.code : 'protocol_failure'));
+        send(response, 200, rpcError(id, -32000, error instanceof McpError ? error.code : 'protocol_failure'));
       }
     }
   }
@@ -192,6 +205,11 @@ export class LoopbackHttpTransport implements ServerTransport {
 function rpcError(id: JsonValue, code: number, category?: string): JsonValue {
   return { jsonrpc: '2.0', id, error: { code, message: 'MCP request refused.',
     ...(category ? { data: { code: category } } : {}) } };
+}
+
+function accepted(response: ServerResponse): void {
+  response.writeHead(202, { 'Content-Length': 0, 'Connection': 'close', 'Cache-Control': 'no-store' });
+  response.end();
 }
 
 function send(response: ServerResponse, status: number, body: JsonValue): void {

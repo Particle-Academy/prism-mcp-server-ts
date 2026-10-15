@@ -1,8 +1,23 @@
 # @particle-academy/prism-mcp-server
 
-Stateless MCP tool registration and dispatch over a consumer-supplied
-`ServerTransport`, with in-memory and authenticated loopback HTTP implementations.
-Node 22+, ESM. No stdio, handshake, sessions, push, resources or prompts.
+MCP tool registration and dispatch over a consumer-supplied `ServerTransport`,
+with in-memory and authenticated loopback HTTP implementations. Node 22+, ESM.
+No stdio, sessions, push, resources or prompts.
+
+Both protocols are served on the same transport and the same tool registry:
+
+- **Stateless** (`2026-07-28`): `server/discover`, then `tools/list` and
+  `tools/call`, each carrying its version and client capabilities in
+  `params._meta`.
+- **Handshake** (`2025-11-25`, `2025-06-18`, `2025-03-26`, `2024-11-05`):
+  `initialize`, `notifications/initialized`, `ping`, `tools/list` and
+  `tools/call`, for clients that always open with `initialize`, such as Codex.
+  No session id is issued, so every request stands alone. An unknown requested
+  revision is answered with `2025-11-25`.
+
+A request carrying any stateless `_meta` key is held to the stateless rules.
+Bearer and Origin checks, request limits, the gate and the result guard apply
+to both protocols in the same way.
 
 The sole runtime dependency is `@particle-academy/prism-mcp`; there are **zero
 third-party runtime dependencies**. Shared definitions, errors, gates and guards
