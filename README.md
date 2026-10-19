@@ -19,6 +19,24 @@ A request carrying any stateless `_meta` key is held to the stateless rules.
 Bearer and Origin checks, request limits, the gate and the result guard apply
 to both protocols in the same way.
 
+## Per-request tool visibility
+
+`register(definition, handler, { visible })` takes an optional predicate that
+decides, per request, whether the tool exists for this caller:
+
+```ts
+server.register(createAgent, handler, {
+  visible: async ({ headers }) => (await registry.agentFor(headers['x-genie-agent']))?.isDefault === true,
+});
+```
+
+The predicate receives the request's headers, without `authorization` or
+`cookie`, and may be async. A hidden tool is absent from `tools/list` on both
+protocols, and its `tools/call` is refused exactly as an unregistered tool's
+(`tool_call_failed`), so a caller cannot tell that it exists. Anything but
+`true`, including a throw or a rejection, hides the tool. A registration
+without a predicate is visible to every caller.
+
 The sole runtime dependency is `@particle-academy/prism-mcp`; there are **zero
 third-party runtime dependencies**. Shared definitions, errors, gates and guards
 come from that package. The official MCP SDK is dev-only, reserved for phase 3

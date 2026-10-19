@@ -27,6 +27,19 @@ export type ToolHandler = (
   context: { server: string; tool: string; headers: Record<string, string> },
 ) => McpToolResult | Promise<McpToolResult>;
 
+/**
+ * Whether a registered tool exists for the caller making THIS request, decided from its headers (minus `authorization`
+ * and `cookie`: the predicate needs to know who is calling, not to hold their credentials). It may be async. Anything
+ * but `true` hides the tool, including a throw or a rejection: visibility fails closed. A hidden tool is absent from
+ * `tools/list` and its `tools/call` is refused exactly as an unregistered tool's, so hiding is not cosmetic.
+ */
+export type ToolVisibility = (context: { headers: Readonly<Record<string, string>> }) => boolean | Promise<boolean>;
+
+export interface RegisterOptions {
+  /** Absent: visible to every caller. */
+  visible?: ToolVisibility;
+}
+
 export interface ServerTransport {
   listen(handler: (request: TransportRequest) => Promise<JsonValue>): Promise<{ url: string; token: string | null }>;
   close(): Promise<void>;
@@ -45,7 +58,7 @@ const CLIENT_INFO = 'io.modelcontextprotocol/clientInfo';
 const SERVER_INFO = 'io.modelcontextprotocol/serverInfo';
 const PREFIX = 'mcp-param-';
 const SERVER_NAME = '@particle-academy/prism-mcp-server';
-const SERVER_VERSION = '0.2.0';
+const SERVER_VERSION = '0.3.0';
 
 // The handshake revisions, served for clients that open with `initialize`
 // (Codex's MCP client always does: prism-mcp-server-ts#1). Newest first; an
@@ -57,6 +70,7 @@ interface RegisteredTool {
   definition: ToolDefinition;
   handler: ToolHandler;
   mirrored: MirroredParameters;
+  visible?: ToolVisibility;
 }
 
 /** Stateless tool serving. Network/security framing belongs to ServerTransport. */
@@ -73,7 +87,7 @@ export class Server {
     this.#guard = options.guard ?? new ResultGuard({ frameProvenance: false });
   }
 
-  register(definition: ToolDefinition, handler: ToolHandler): void {
+  register(definition: ToolDefinition, handler: ToolHandler, options: RegisterOptions = {}): void {
     this.#assertOpen();
     if (this.#tools.has(definition.name) || this.#refused.has(definition.name)) {
       throw new McpError('protocol_failure', 'A tool with this name is already registered or refused.');
@@ -90,7 +104,7 @@ export class Server {
       }
       throw error;
     }
-    this.#tools.set(snapshot.name, { definition: snapshot, handler, mirrored });
+    this.#tools.set(snapshot.name, { definition: snapshot, handler, mirrored, visible: options.visible });
   }
 
   listen(): Promise<{ url: string; token: string | null }> {
@@ -119,7 +133,7 @@ export class Server {
     if (classic) return this.#classic(request, params);
     assertProtocol(params);
     if (request.method === 'tools/list') {
-      return complete({ tools: this.#listed(), ttlMs: 0, cacheScope: 'private' });
+      return complete({ tools: await this.#listed(request), ttlMs: 0, cacheScope: 'private' });
     }
     if (request.method !== 'tools/call') {
       throw new McpError('protocol_failure', 'Only server/discover, tools/list and tools/call are supported on the stateless revision.');
@@ -146,14 +160,18 @@ export class Server {
     // than sent to a client that may deserialize strictly. The stateless payload
     // is untouched: tool digests are computed over it.
     if (request.method === 'tools/list') {
-      return { tools: this.#listed().map((tool) => Object.fromEntries(Object.entries(tool).filter(([, value]) => value !== null))) };
+      return { tools: (await this.#listed(request)).map((tool) => Object.fromEntries(Object.entries(tool).filter(([, value]) => value !== null))) };
     }
     if (request.method === 'tools/call') return this.#call(request, params);
     throw new McpError('protocol_failure', 'Only initialize, ping, tools/list and tools/call are supported.');
   }
 
-  #listed(): JsonObject[] {
-    return [...this.#tools.values()].map(({ definition }) => payloadOf(definition));
+  async #listed(request: TransportRequest): Promise<JsonObject[]> {
+    const listed: JsonObject[] = [];
+    for (const tool of this.#tools.values()) {
+      if (tool.visible === undefined || await isVisible(tool, request)) listed.push(payloadOf(tool.definition));
+    }
+    return listed;
   }
 
   async #call(request: TransportRequest, params: JsonObject): Promise<JsonObject> {
@@ -164,7 +182,11 @@ export class Server {
       throw new McpError('mirrored_parameter_refused', 'The tool has invalid mirrored-parameter annotations.');
     }
     const tool = this.#tools.get(params.name);
-    if (!tool) throw new McpError('tool_call_failed', 'The requested tool is not registered.');
+    // A hidden tool is refused with the SAME error as an unregistered one, so a caller cannot learn that it exists.
+    // Awaited only when there IS a predicate, so a tool without one keeps exactly the timing it always had.
+    if (!tool || (tool.visible !== undefined && !(await isVisible(tool, request)))) {
+      throw new McpError('tool_call_failed', 'The requested tool is not registered.');
+    }
     if (params.arguments !== undefined && !isJsonObject(params.arguments)) {
       throw new McpError('protocol_failure', 'Tool arguments must be an object.');
     }
@@ -193,6 +215,22 @@ export class Server {
 
   #assertOpen(): void {
     if (this.#closed) throw new McpError('protocol_failure', 'The server is closed.');
+  }
+}
+
+/** Visible unless a predicate says otherwise; a predicate that throws, rejects or answers anything but `true` hides. */
+async function isVisible(tool: RegisteredTool, request: TransportRequest): Promise<boolean> {
+  if (tool.visible === undefined) return true;
+  const headers: Record<string, string> = Object.create(null) as Record<string, string>;
+  for (const [name, value] of Object.entries(request.headers ?? {})) {
+    const key = name.toLowerCase();
+    if (key === 'authorization' || key === 'cookie') continue;
+    headers[key] = value;
+  }
+  try {
+    return (await tool.visible({ headers: Object.freeze(headers) })) === true;
+  } catch {
+    return false;
   }
 }
 

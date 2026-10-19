@@ -14,7 +14,7 @@ const VERSION = 'io.modelcontextprotocol/protocolVersion';
 const CAPABILITIES = 'io.modelcontextprotocol/clientCapabilities';
 const CLIENT_INFO = 'io.modelcontextprotocol/clientInfo';
 const RESULT_META = { resultType: 'complete', _meta: {
-  'io.modelcontextprotocol/serverInfo': { name: '@particle-academy/prism-mcp-server', version: '0.2.0' },
+  'io.modelcontextprotocol/serverInfo': { name: '@particle-academy/prism-mcp-server', version: '0.3.0' },
 } };
 
 function request(method = 'tools/list', params: JsonObject = {}, headers: Record<string, string> = {}): TransportRequest {

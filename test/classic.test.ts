@@ -54,7 +54,7 @@ it('serves the classic initialize -> initialized -> tools/list -> tools/call exc
   expect(init.body.result).toEqual({
     protocolVersion: '2025-06-18',
     capabilities: { tools: {} },
-    serverInfo: { name: '@particle-academy/prism-mcp-server', version: '0.2.0' },
+    serverInfo: { name: '@particle-academy/prism-mcp-server', version: '0.3.0' },
   });
 
   const initialized = await send(url, token, { jsonrpc: '2.0', method: 'notifications/initialized' });

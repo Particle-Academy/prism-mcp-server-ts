@@ -70,7 +70,7 @@ it.each(['tools/list', 'tools/call'])('serves %s without clientInfo over HTTP wh
   expect(reply.status).toBe(200);
   expect(reply.headers).not.toHaveProperty('mcp-session-id');
   expect(reply.body.result).toMatchObject({ resultType: 'complete', _meta: {
-    'io.modelcontextprotocol/serverInfo': { name: '@particle-academy/prism-mcp-server', version: '0.2.0' },
+    'io.modelcontextprotocol/serverInfo': { name: '@particle-academy/prism-mcp-server', version: '0.3.0' },
   } });
   if (method === 'tools/list') expect((reply.body.result as JsonObject).tools).toHaveLength(1);
   else { expect((reply.body.result as JsonObject).content).toEqual([{ type: 'text', text: 'served' }]); expect(handler).toHaveBeenCalledOnce(); }
@@ -94,7 +94,7 @@ it.each([
   expect(reply.body).toEqual({ jsonrpc: '2.0', id: 'probe', result: {
     resultType: 'complete', supportedVersions: ['2026-07-28'], capabilities: { tools: {} },
     ttlMs: 0, cacheScope: 'private', _meta: {
-      'io.modelcontextprotocol/serverInfo': { name: '@particle-academy/prism-mcp-server', version: '0.2.0' },
+      'io.modelcontextprotocol/serverInfo': { name: '@particle-academy/prism-mcp-server', version: '0.3.0' },
     },
   } });
 });
