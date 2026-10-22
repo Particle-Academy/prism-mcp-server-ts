@@ -14,7 +14,7 @@ const VERSION = 'io.modelcontextprotocol/protocolVersion';
 const CAPABILITIES = 'io.modelcontextprotocol/clientCapabilities';
 const CLIENT_INFO = 'io.modelcontextprotocol/clientInfo';
 const RESULT_META = { resultType: 'complete', _meta: {
-  'io.modelcontextprotocol/serverInfo': { name: '@particle-academy/prism-mcp-server', version: '0.3.0' },
+  'io.modelcontextprotocol/serverInfo': { name: '@particle-academy/prism-mcp-server', version: '0.3.1' },
 } };
 
 function request(method = 'tools/list', params: JsonObject = {}, headers: Record<string, string> = {}): TransportRequest {
@@ -284,5 +284,39 @@ describe('in-memory lifecycle without a timeout', () => {
     await expect(transport.request(request())).rejects.toMatchObject({ code: 'protocol_failure' });
     expect(() => server.register(definition('later'), echo)).toThrow(McpError);
     finish({ text: 'late handler completion', isError: false });
+  });
+});
+
+/*
+ * A NULL IS NOT AN OPTIONAL STRING (tynn, Genie 2, 2026-10-22). Claude Code validates tools/list strictly and dropped
+ * the WHOLE server on one `title: null` -- "Invalid result for tools/list: path ["tools",17,"title"] ... expected
+ * string, received null" -- so a single tool without a title hid every tool the server had. Claude Code 2.1.301 takes
+ * the modern path; the classic path already omitted nulls (classic.test.ts pins that).
+ */
+describe('tools/list never sends a null field', () => {
+  it('a tool with no title is listed WITHOUT a title, not with null', async () => {
+    const { server, transport } = await setup();
+    const untitled = new ToolDefinition('plain', 'No title.', { type: 'object' });
+    expect(untitled.title).toBeNull();
+    server.register(untitled, echo);
+    server.register(definition('titled'), echo);
+
+    const reply = await transport.request(request()) as { tools: JsonObject[] };
+    const plain = reply.tools.find((tool) => tool.name === 'plain')!;
+    expect(Object.hasOwn(plain, 'title')).toBe(false);
+    for (const tool of reply.tools) {
+      expect(Object.entries(tool).filter(([, value]) => value === null)).toEqual([]);
+    }
+    expect(reply.tools.find((tool) => tool.name === 'titled')?.title).toBe('Echo');
+    await server.close();
+  });
+
+  it('and the pin a client computes from that entry is still the registered definition\'s', async () => {
+    const { server, transport } = await setup();
+    const untitled = new ToolDefinition('plain', 'No title.', { type: 'object' });
+    server.register(untitled, echo);
+    const reply = await transport.request(request()) as { tools: JsonObject[] };
+    expect(ClientToolDefinition.fromPayload(JSON.parse(JSON.stringify(reply.tools[0])) as JsonObject).digest()).toBe(untitled.digest());
+    await server.close();
   });
 });

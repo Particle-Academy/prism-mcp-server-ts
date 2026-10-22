@@ -6,7 +6,7 @@ const VERSION = 'io.modelcontextprotocol/protocolVersion';
 const CAPABILITIES = 'io.modelcontextprotocol/clientCapabilities';
 const CLIENT_INFO = 'io.modelcontextprotocol/clientInfo';
 const SERVER_INFO = 'io.modelcontextprotocol/serverInfo';
-const identity = { name: '@particle-academy/prism-mcp-server', version: '0.3.0' };
+const identity = { name: '@particle-academy/prism-mcp-server', version: '0.3.1' };
 
 function request(method: string, clientInfo = true): TransportRequest {
   return { method, params: { name: 'echo', _meta: {

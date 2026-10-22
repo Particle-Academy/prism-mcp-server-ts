@@ -58,7 +58,7 @@ const CLIENT_INFO = 'io.modelcontextprotocol/clientInfo';
 const SERVER_INFO = 'io.modelcontextprotocol/serverInfo';
 const PREFIX = 'mcp-param-';
 const SERVER_NAME = '@particle-academy/prism-mcp-server';
-const SERVER_VERSION = '0.3.0';
+const SERVER_VERSION = '0.3.1';
 
 // The handshake revisions, served for clients that open with `initialize`
 // (Codex's MCP client always does: prism-mcp-server-ts#1). Newest first; an
@@ -133,7 +133,7 @@ export class Server {
     if (classic) return this.#classic(request, params);
     assertProtocol(params);
     if (request.method === 'tools/list') {
-      return complete({ tools: await this.#listed(request), ttlMs: 0, cacheScope: 'private' });
+      return complete({ tools: (await this.#listed(request)).map(withoutNulls), ttlMs: 0, cacheScope: 'private' });
     }
     if (request.method !== 'tools/call') {
       throw new McpError('protocol_failure', 'Only server/discover, tools/list and tools/call are supported on the stateless revision.');
@@ -156,11 +156,8 @@ export class Server {
         `Protocol version [${header}] is not served on the handshake path; expected one of [${CLASSIC_VERSIONS.join(', ')}].`);
     }
     if (request.method === 'ping') return {};
-    // The spec types title as an optional string, so a null is omitted rather
-    // than sent to a client that may deserialize strictly. The stateless payload
-    // is untouched: tool digests are computed over it.
     if (request.method === 'tools/list') {
-      return { tools: (await this.#listed(request)).map((tool) => Object.fromEntries(Object.entries(tool).filter(([, value]) => value !== null))) };
+      return { tools: (await this.#listed(request)).map(withoutNulls) };
     }
     if (request.method === 'tools/call') return this.#call(request, params);
     throw new McpError('protocol_failure', 'Only initialize, ping, tools/list and tools/call are supported.');
@@ -277,6 +274,21 @@ function cloneObject(value: JsonObject): JsonObject {
   } catch {
     throw new McpError('protocol_failure', 'Expected JSON-serializable data.');
   }
+}
+
+/**
+ * A tools/list entry with its null fields left out, on BOTH protocol paths. The spec types `title` (like every
+ * optional field) as an optional string: absent is valid, null is not. Claude Code validates strictly and drops the
+ * WHOLE server on one null -- "Invalid result for tools/list: path ["tools",17,"title"] ... expected string, received
+ * null" (tynn, Genie 2, 2026-10-22) -- so a single tool with no title hid every tool the server had. The classic path
+ * already omitted nulls; the modern path sent them.
+ *
+ * Pins are unaffected: ToolDefinition.fromPayload() reads an absent title as null, so the digest a client computes
+ * from the entry is the digest of the registered definition (the mcp-tool-digest corpus test holds this through the
+ * real tools/list).
+ */
+function withoutNulls(tool: JsonObject): JsonObject {
+  return Object.fromEntries(Object.entries(tool).filter(([, value]) => value !== null)) as JsonObject;
 }
 
 function payloadOf(tool: ToolDefinition): JsonObject {
