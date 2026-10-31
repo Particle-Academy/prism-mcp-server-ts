@@ -2,7 +2,7 @@
 
 MCP tool registration and dispatch over a consumer-supplied `ServerTransport`,
 with in-memory and authenticated loopback HTTP implementations. Node 22+, ESM.
-No stdio, sessions, push, resources or prompts.
+No stdio, sessions, independent GET push, resources or prompts.
 
 Both protocols are served on the same transport and the same tool registry:
 
@@ -58,7 +58,8 @@ await server.close();
 
 `register(definition, handler)` accepts the shared `ToolDefinition`. The exact
 handler contract is `(args: JsonObject, context: { server: string; tool: string;
-headers: Record<string, string> }) => McpToolResult | Promise<McpToolResult>`.
+headers: Record<string, string>; progress?: ToolProgress; signal?: AbortSignal })
+=> McpToolResult | Promise<McpToolResult>`.
 Definitions are snapshotted; duplicate names fail. Invalid mirrored annotations
 throw `mirrored_parameter_refused`, are absent from `tools/list`, and cannot run.
 Listed definitions preserve the client's digest, including nested schemas/title.
@@ -91,7 +92,7 @@ versions. The probe needs no `params`, `_meta`, capabilities or client identity,
 creates no session, and does not change server state. It uses the same
 HTTP bearer and Origin checks as tool requests. Every successful result includes
 `resultType: 'complete'` and `_meta['io.modelcontextprotocol/serverInfo']` identifying
-the serving software as `{ name: '@particle-academy/prism-mcp-server', version: '0.1.0' }`.
+the serving software by package name and version.
 Discovery and tool lists include `ttlMs: 0, cacheScope: 'private'`; callers re-fetch
 to observe registration changes. Tool call results also carry
 `{ content: [{ type: 'text', text }], isError }`; failures throw
@@ -134,11 +135,15 @@ must exactly match the listener's own origin by default. `allowedOrigins` replac
 that allow-list with explicit `http://127.0.0.1:<port>` / `https://[::1]:<port>`
 origins (either scheme is supported); arbitrary hostnames, paths, wildcard origins
 and non-loopback addresses are refused at startup. No browser CORS/preflight
-support is provided. GET, upgrades, CONNECT and SSE-only requests are refused;
-an Accept header offering both JSON and SSE receives JSON.
+support is provided. GET, upgrades and CONNECT are refused. JSON-only clients
+keep JSON responses. A `tools/call` offering `text/event-stream` receives SSE;
+an `Accept: */*` keeps the existing JSON choice. Other methods require JSON in
+their accepted media types. A media range with `q=0` does not opt into SSE.
 
 POSTs require `Content-Length` and JSON content; chunked uploads, batches,
-notifications and ambiguous duplicate headers are refused. `maxRequestBytes`
+and ambiguous duplicate headers are refused. Notifications receive 202 with no
+body; authenticated `notifications/cancelled` can cancel a pending tool request.
+`maxRequestBytes`
 defaults to 1 MiB. Responses carry the same request id and either `result` or a
 JSON-RPC `error` with the shared Prism category in `error.data.code`; arbitrary
 diagnostic messages are withheld. HTTP refusal uses 401 for credentials and 403
@@ -146,7 +151,63 @@ for Origin. No request, header or socket deadline is imposed. `close()` releases
 every socket, including incomplete HTTP headers and held long-polls, before
 resolving; handler-owned application work still needs embedder cleanup.
 
+## Long-running HTTP tools
+
+SSE starts immediately after authentication and request validation with an
+`: open` comment. A comment heartbeat follows every ten seconds; configure
+`heartbeatIntervalMs` to change the positive interval. The final
+`event: message` carries the same JSON-RPC result or error, then the stream ends.
+No event IDs, sessions or reconnection replay are offered. Heartbeats carry no
+application data. This follows MCP's [Streamable HTTP response contract](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports).
+
+When the request supplies a string or integer `params._meta.progressToken`,
+the stream sends an initial `notifications/progress`. Handlers can report more:
+
+```ts
+server.register(waitTool, async (args, { progress, signal }) => {
+  progress?.('Waiting for approval', 1, 2);
+  const answer = await applicationWait({ signal }); // Host code must cooperate.
+  progress?.('Approval received', 2, 2);
+  return { text: answer, isError: false };
+});
+```
+
+Progress uses the current request's token only. Values must be finite,
+nonnegative and strictly increasing; optional totals must be finite and at least
+the progress value. Omitting the value increments the previous value by one.
+Messages are limited to 4096 UTF-8 bytes, JSON-escaped and sent only on that
+request's stream. Under output backpressure updates may be dropped rather than
+queued without bound. Invalid updates, late updates, missing tokens and JSON-only
+requests produce no progress messages; reporting progress never throws into the
+handler. Messages are explicit host output: supply user-safe text, without
+credentials, raw arguments or private diagnostics. Automatic messages include
+none of those values.
+
+HTTP tool contexts receive an `AbortSignal`. An authenticated
+`notifications/cancelled` with `params.requestId` signals the matching active
+call and ends its response without a final result. Malformed, unknown or completed
+IDs are ignored. This stateless listener shares one bearer principal and has no
+client sessions: if simultaneous clients reuse an active ID, cancellation by that
+ID is ignored rather than choosing another caller. Use unambiguous active IDs.
+Cancellation reasons are not forwarded or logged. A tool still waiting on its
+gate does not start after cancellation.
+
+By default a disconnected connection stops heartbeats and drops late output
+without aborting its handler, as [MCP cancellation semantics](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/cancellation)
+require. To abandon work whose listener has gone away, use
+`new LoopbackHttpTransport({ abortOnDisconnect: true })`; then a dropped JSON or
+SSE response also fires its own handler signal. This opts into cancellation on
+connection loss, so a transient disconnect can cancel application work. Signals
+are cooperative: handlers must observe them to stop pending approvals, subprocess
+waits or other work. No JavaScript promise can forcibly interrupt arbitrary code.
+
+No breaking changes to JSON-only classic responses are intended; their exact
+response bytes and security headers are compared against the previous source.
+The tests also cover classic requests that accept SSE, fake timers for 35-minute calls and
+disconnect/explicit-cancellation cleanup. Consumer acceptance in an actual
+Claude Code client remains a separate measurement.
+
 Local gates: `npm run typecheck`, `npm run build`, `npm test`. Test sources are
-typechecked too. No remote, publishing workflow or tag is configured here.
+typechecked too. CI runs the gates on Node 22, 24 and 26.
 The complete suite includes a real 310-second HTTP long-poll and takes about
 six minutes. SDK reference-client conformance is not part of this phase.
