@@ -200,7 +200,7 @@ it('preserves stateless metadata inside the final SSE response', async () => {
   }); await f.started; await wire.first; f.finish();
   expect(messages(await wire.done).at(-1)).toEqual({ jsonrpc: '2.0', id: 'call', result: {
     content: [{ type: 'text', text: 'complete' }], isError: false, resultType: 'complete',
-    _meta: { 'io.modelcontextprotocol/serverInfo': { name: '@particle-academy/prism-mcp-server', version: '0.3.1' } },
+    _meta: { 'io.modelcontextprotocol/serverInfo': { name: '@particle-academy/prism-mcp-server', version: '0.4.0' } },
   } });
 });
 
