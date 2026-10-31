@@ -1,6 +1,6 @@
 {
   "name": "@particle-academy/prism-mcp-server",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Transport-independent MCP tool serving for the Prism ecosystem.",
   "type": "module",
   "sideEffects": false,

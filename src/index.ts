@@ -62,7 +62,7 @@ const CLIENT_INFO = 'io.modelcontextprotocol/clientInfo';
 const SERVER_INFO = 'io.modelcontextprotocol/serverInfo';
 const PREFIX = 'mcp-param-';
 const SERVER_NAME = '@particle-academy/prism-mcp-server';
-const SERVER_VERSION = '0.4.0';
+const SERVER_VERSION = '0.5.0';
 
 // The handshake revisions, served for clients that open with `initialize`
 // (Codex's MCP client always does: prism-mcp-server-ts#1). Newest first; an
