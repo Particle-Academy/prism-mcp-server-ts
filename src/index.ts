@@ -22,9 +22,13 @@ export { McpError, MirroredParameters, ResultGuard, ToolDefinition, allowAll };
 export type { JsonObject, JsonValue, McpErrorCode, McpToolResult, ToolGate, TransportRequest };
 export { LoopbackHttpTransport, type LoopbackHttpOptions } from './http.js';
 
+export type ToolProgress = (message: string, progress?: number, total?: number) => void;
+/** Optional transport-owned reply channel; shared request fields remain the sibling's. */
+export interface ServerTransportRequest extends TransportRequest { progress?: ToolProgress; signal?: AbortSignal; }
+
 export type ToolHandler = (
   args: JsonObject,
-  context: { server: string; tool: string; headers: Record<string, string> },
+  context: { server: string; tool: string; headers: Record<string, string>; progress?: ToolProgress; signal?: AbortSignal },
 ) => McpToolResult | Promise<McpToolResult>;
 
 /**
@@ -41,7 +45,7 @@ export interface RegisterOptions {
 }
 
 export interface ServerTransport {
-  listen(handler: (request: TransportRequest) => Promise<JsonValue>): Promise<{ url: string; token: string | null }>;
+  listen(handler: (request: ServerTransportRequest) => Promise<JsonValue>): Promise<{ url: string; token: string | null }>;
   close(): Promise<void>;
 }
 
@@ -117,7 +121,7 @@ export class Server {
     await this.options.transport.close();
   }
 
-  async handle(request: TransportRequest): Promise<JsonValue> {
+  async handle(request: ServerTransportRequest): Promise<JsonValue> {
     this.#assertOpen();
     // Discovery precedes version selection: it cannot require the metadata of
     // an agreed revision. HTTP bearer/Origin checks still run in the transport.
@@ -171,7 +175,7 @@ export class Server {
     return listed;
   }
 
-  async #call(request: TransportRequest, params: JsonObject): Promise<JsonObject> {
+  async #call(request: ServerTransportRequest, params: JsonObject): Promise<JsonObject> {
     if (typeof params.name !== 'string' || params.name === '') {
       throw new McpError('protocol_failure', 'tools/call requires a tool name.');
     }
@@ -195,8 +199,14 @@ export class Server {
     }
     this.#assertOpen();
     let result: McpToolResult;
+    if (request.signal?.aborted) throw new McpError('tool_call_failed', 'The request was cancelled.');
     try {
-      result = await tool.handler(args, { server: this.options.server, tool: tool.definition.name, headers });
+      result = await tool.handler(args, { server: this.options.server, tool: tool.definition.name, headers,
+        ...(request.signal === undefined ? {} : { signal: request.signal }),
+        ...(request.progress === undefined ? {} : { progress: (message: string, progress?: number, total?: number): void => {
+          try { request.progress?.(message, progress, total); } catch { /* Transport progress cannot fail a tool. */ }
+        } }),
+      });
     } catch (error) {
       // Exception messages may carry credentials or prompts: only the shared
       // category survives, never arbitrary handler diagnostic text.

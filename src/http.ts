@@ -1,8 +1,8 @@
 import crypto from 'node:crypto';
 import http, { type IncomingMessage, type Server as HttpServer, type ServerResponse } from 'node:http';
 import type { Socket } from 'node:net';
-import { McpError, isJsonObject, type JsonValue, type TransportRequest } from '@particle-academy/prism-mcp';
-import type { ServerTransport } from './index.js';
+import { McpError, isJsonObject, type JsonValue } from '@particle-academy/prism-mcp';
+import type { ServerTransport, ServerTransportRequest, ToolProgress } from './index.js';
 
 export interface LoopbackHttpOptions {
   port?: number;
@@ -11,6 +11,10 @@ export interface LoopbackHttpOptions {
   /** Exact numeric loopback origins. Defaults to this listener's own origin. */
   allowedOrigins?: readonly string[];
   maxRequestBytes?: number;
+  /** SSE comment cadence for opted-in tools/call requests. Defaults to ten seconds. */
+  heartbeatIntervalMs?: number;
+  /** Opt in to cancelling work when its response connection drops. Default false. */
+  abortOnDisconnect?: boolean;
 }
 
 const TOKEN = /^[A-Za-z0-9._~+/-]+=*$/;
@@ -31,6 +35,10 @@ export class LoopbackHttpTransport implements ServerTransport {
   readonly #configuredToken?: string;
   readonly #configuredOrigins?: readonly string[];
   readonly #maxRequestBytes: number;
+  readonly #heartbeatIntervalMs: number;
+  readonly #abortOnDisconnect: boolean;
+  readonly #calls = new Map<string | number, Set<{ controller: AbortController; detach: () => void }>>();
+  readonly #streams = new Set<{ response: ServerResponse; stop: () => void }>();
   readonly #sockets = new Set<Socket>();
   #server?: HttpServer;
   #starting?: Promise<void>;
@@ -42,13 +50,17 @@ export class LoopbackHttpTransport implements ServerTransport {
     this.#configuredToken = options.token;
     this.#configuredOrigins = options.allowedOrigins?.slice();
     this.#maxRequestBytes = options.maxRequestBytes ?? 1024 * 1024;
+    this.#heartbeatIntervalMs = options.heartbeatIntervalMs ?? 10000;
+    this.#abortOnDisconnect = options.abortOnDisconnect ?? false;
     if (!Number.isInteger(this.#port) || this.#port < 0 || this.#port > 65535
-      || !Number.isSafeInteger(this.#maxRequestBytes) || this.#maxRequestBytes <= 0) {
+      || !Number.isSafeInteger(this.#maxRequestBytes) || this.#maxRequestBytes <= 0
+      || !Number.isSafeInteger(this.#heartbeatIntervalMs) || this.#heartbeatIntervalMs < 1 || this.#heartbeatIntervalMs > 2147483647
+      || typeof this.#abortOnDisconnect !== 'boolean') {
       throw new McpError('protocol_failure', 'Invalid HTTP transport limits.');
     }
   }
 
-  async listen(handler: (request: TransportRequest) => Promise<JsonValue>): Promise<{ url: string; token: string }> {
+  async listen(handler: (request: ServerTransportRequest) => Promise<JsonValue>): Promise<{ url: string; token: string }> {
     if (this.#closed || this.#server) throw new McpError('protocol_failure', 'Transport is closed or already listening.');
     const token = this.#configuredToken === undefined ? crypto.randomBytes(32).toString('hex') : this.#configuredToken;
     // Validate before creating any listener; an empty credential must never match.
@@ -120,7 +132,7 @@ export class LoopbackHttpTransport implements ServerTransport {
   }
 
   async #respond(request: IncomingMessage, response: ServerResponse,
-    handler: (request: TransportRequest) => Promise<JsonValue>,
+    handler: (request: ServerTransportRequest) => Promise<JsonValue>,
     authorize: (request: IncomingMessage) => number | undefined): Promise<void> {
     const status = authorize(request);
     if (status) { send(response, status, rpcError(null, -32000)); return; }
@@ -130,7 +142,7 @@ export class LoopbackHttpTransport implements ServerTransport {
       send(response, 405, rpcError(null, -32600)); return;
     }
     const accept = request.headers.accept;
-    if (accept && !accept.split(',').some((entry) => /^(application\/json|\*\/\*)(?:\s*;|$)/i.test(entry.trim()))) {
+    if (accept && !allows(accept, 'application/json') && !allows(accept, 'text/event-stream')) {
       send(response, 406, rpcError(null, -32600)); return;
     }
     if (request.headers['content-type']?.split(';')[0].trim().toLowerCase() !== 'application/json') {
@@ -165,9 +177,22 @@ export class LoopbackHttpTransport implements ServerTransport {
       || typeof body.method !== 'string' || (body.params !== undefined && !isJsonObject(body.params))) {
       send(response, 400, rpcError(null, -32600)); return;
     }
+    if (accept && body.method !== 'tools/call' && !allows(accept, 'application/json')) {
+      send(response, 406, rpcError(null, -32600)); return;
+    }
     if (this.#closed || response.destroyed) return;
     if (notification) {
       // Streamable HTTP answers an accepted notification 202 with no body.
+      if (body.method === 'notifications/cancelled') {
+        const target = body.params?.requestId;
+        if (typeof target === 'string' || (typeof target === 'number' && Number.isFinite(target))) {
+          const matches = this.#calls.get(target);
+          // No session identity exists here. Never pick a different caller when
+          // authenticated concurrent clients happen to reuse a JSON-RPC id.
+          if (matches?.size === 1) [...matches][0].controller.abort();
+        }
+        accepted(response); return;
+      }
       try { await handler({ method: body.method, params: body.params, headers }); }
       catch { if (!this.#closed && !response.destroyed) send(response, 400, rpcError(null, -32600)); return; }
       if (!this.#closed && !response.destroyed) accepted(response);
@@ -175,13 +200,90 @@ export class LoopbackHttpTransport implements ServerTransport {
     }
     // Validated above: every message that is not a notification has one.
     const id = body.id as string | number;
+    const controller = body.method === 'tools/call' ? new AbortController() : undefined;
+    const onDisconnect = (): void => {
+      if (this.#abortOnDisconnect && !response.writableEnded) controller?.abort();
+    };
+    const onAbort = (): void => {
+      if (response.destroyed || response.writableEnded) return;
+      if (!response.headersSent) response.writeHead(204, { 'Connection': 'close', 'Cache-Control': 'no-store' });
+      response.end();
+    };
+    const call = { controller: controller!, detach: (): void => {
+      response.removeListener('close', onDisconnect);
+      controller?.signal.removeEventListener('abort', onAbort);
+    } };
+    if (controller) {
+      const active = this.#calls.get(id) ?? new Set(); active.add(call); this.#calls.set(id, active);
+      response.once('close', onDisconnect); controller.signal.addEventListener('abort', onAbort, { once: true });
+    }
     try {
-      const result = await handler({ method: body.method, params: body.params, headers });
-      if (!this.#closed && !response.destroyed) send(response, 200, { jsonrpc: '2.0', id, result });
+      const request = { method: body.method, params: body.params, headers, ...(controller ? { signal: controller.signal } : {}) };
+      const sse = allows(accept, 'text/event-stream', true)
+        || (allows(accept, 'text/event-stream') && !allows(accept, 'application/json'));
+      if (body.method === 'tools/call' && sse) { await this.#stream(response, request, id, handler); return; }
+      const result = await handler(request);
+      if (!this.#closed && !response.destroyed && !controller?.signal.aborted) send(response, 200, { jsonrpc: '2.0', id, result });
     } catch (error) {
-      if (!this.#closed && !response.destroyed) {
+      if (!this.#closed && !response.destroyed && !controller?.signal.aborted) {
         send(response, 200, rpcError(id, -32000, error instanceof McpError ? error.code : 'protocol_failure'));
       }
+    } finally {
+      call.detach();
+      if (controller) { const active = this.#calls.get(id); active?.delete(call); if (active?.size === 0) this.#calls.delete(id); }
+    }
+  }
+
+  async #stream(response: ServerResponse, request: ServerTransportRequest, id: string | number,
+    handler: (request: ServerTransportRequest) => Promise<JsonValue>): Promise<void> {
+    // POST SSE is a response to this authenticated request, never a GET push channel.
+    // Open immediately: no held headers and no threshold timer racing a fast result.
+    response.writeHead(200, { 'Content-Type': 'text/event-stream', 'Connection': 'close',
+      'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' });
+    response.flushHeaders();
+    response.write(': open\n\n');
+    let active = true, timer: ReturnType<typeof setInterval> | undefined, last = -1;
+    const stream = { response, stop: (): void => {
+      active = false;
+      if (timer !== undefined) { clearInterval(timer); timer = undefined; }
+      this.#streams.delete(stream);
+      response.removeListener('close', stream.stop);
+      request.signal?.removeEventListener('abort', onCancel);
+    } };
+    this.#streams.add(stream);
+    response.once('close', stream.stop);
+    const onCancel = (): void => { stream.stop(); if (!response.destroyed && !response.writableEnded) response.end(); };
+    request.signal?.addEventListener('abort', onCancel, { once: true });
+    const writable = (): boolean => active && !this.#closed && !response.destroyed && !response.writableEnded;
+    const event = (value: JsonValue): void => { response.write(`event: message\ndata: ${JSON.stringify(value)}\n\n`); };
+    const meta = request.params?._meta;
+    const token = isJsonObject(meta) ? meta.progressToken : undefined;
+    const hasToken = typeof token === 'string' || (typeof token === 'number' && Number.isFinite(token) && Number.isInteger(token));
+    const progress: ToolProgress = (message, amount, total): void => {
+      try {
+        if (!hasToken || !writable() || response.writableNeedDrain || typeof message !== 'string') return;
+        const next = amount ?? last + 1;
+        if (!Number.isFinite(next) || next < 0 || next <= last
+          || (total !== undefined && (!Number.isFinite(total) || total < next))) return;
+        const params: JsonValue = { progressToken: token as string | number, progress: next,
+          ...(total === undefined ? {} : { total }), message: boundedMessage(message) };
+        event({ jsonrpc: '2.0', method: 'notifications/progress', params }); last = next;
+      } catch { /* Best-effort progress never throws into a tool handler. */ }
+    };
+    progress('Tool call started.', 0);
+    timer = setInterval(() => {
+      if (!writable()) { stream.stop(); return; }
+      if (!response.writableNeedDrain) response.write(': heartbeat\n\n');
+    }, this.#heartbeatIntervalMs);
+    timer.unref();
+    try {
+      const result = await handler({ ...request, progress });
+      if (writable()) event({ jsonrpc: '2.0', id, result });
+    } catch (error) {
+      if (writable()) event(rpcError(id, -32000, error instanceof McpError ? error.code : 'protocol_failure'));
+    } finally {
+      const finish = writable(); stream.stop();
+      if (finish) response.end();
     }
   }
 
@@ -190,16 +292,51 @@ export class LoopbackHttpTransport implements ServerTransport {
     if (this.#closing) return this.#closing;
     this.#closing = (async () => {
       await this.#starting?.catch(() => {});
+      for (const calls of this.#calls.values()) for (const call of calls) call.detach();
+      this.#calls.clear();
       await new Promise<void>((resolve) => {
         const server = this.#server;
         if (!server) { resolve(); return; }
-        server.close(() => resolve());
+        const streamingSockets = new Set<Socket>();
+        for (const stream of [...this.#streams]) {
+          if (stream.response.socket) streamingSockets.add(stream.response.socket);
+          stream.stop(); stream.response.end();
+        }
+        // Let SSE responses finish normally; a stalled reader cannot hold shutdown.
+        const expiry = streamingSockets.size ? setTimeout(() => {
+          for (const socket of streamingSockets) socket.destroy();
+        }, 100).unref() : undefined;
+        server.close(() => { if (expiry) clearTimeout(expiry); resolve(); });
         // closeAllConnections omits upgraded sockets; track and end every socket.
-        for (const socket of this.#sockets) socket.destroy();
+        for (const socket of this.#sockets) if (!streamingSockets.has(socket)) socket.destroy();
       });
     })();
     return this.#closing;
   }
+}
+
+/** An explicit SSE media range opts in; wildcards retain the existing JSON choice. */
+function allows(accept: string | undefined, media: string, explicit = false): boolean {
+  if (accept === undefined) return !explicit;
+  let quality = -1, specificity = -1;
+  for (const entry of accept.split(',')) {
+    const [range, ...parameters] = entry.trim().toLowerCase().split(';').map(value => value.trim());
+    const rank = range === media ? 2 : !explicit && range === media.split('/')[0] + '/*' ? 1 : !explicit && range === '*/*' ? 0 : -1;
+    if (rank < specificity || rank < 0) continue;
+    const raw = parameters.find(value => value.startsWith('q='))?.slice(2);
+    const next = raw === undefined ? 1 : /^(?:0(?:\.\d{0,3})?|1(?:\.0{0,3})?)$/.test(raw) ? Number(raw) : 0;
+    quality = rank === specificity ? Math.max(quality, next) : next; specificity = rank;
+  }
+  return quality > 0;
+}
+
+function boundedMessage(message: string): string {
+  let result = '', bytes = 0;
+  for (const char of message.slice(0, 4096)) {
+    const next = Buffer.byteLength(char, 'utf8'); if (bytes + next > 4096) break;
+    result += char; bytes += next;
+  }
+  return result;
 }
 
 function rpcError(id: JsonValue, code: number, category?: string): JsonValue {

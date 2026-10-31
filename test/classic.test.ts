@@ -27,7 +27,9 @@ function send(url: string, token: string | undefined, body: JsonObject, headers:
   const data = JSON.stringify(body);
   return new Promise((resolve, reject) => {
     const request = http.request(url, { method: 'POST', agent: false, headers: {
-      'Content-Type': 'application/json', 'Accept': 'application/json, text/event-stream',
+      // This suite locks the JSON-only classic client contract. SSE-capable
+      // classic requests are independently parsed and asserted in sse.test.ts.
+      'Content-Type': 'application/json', 'Accept': 'application/json',
       'Content-Length': Buffer.byteLength(data),
       ...(token === undefined ? {} : { Authorization: `Bearer ${token}` }), ...headers } }, (response) => {
       let text = '';
