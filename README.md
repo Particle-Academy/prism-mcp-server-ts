@@ -161,7 +161,12 @@ No event IDs, sessions or reconnection replay are offered. Heartbeats carry no
 application data. This follows MCP's [Streamable HTTP response contract](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports).
 
 When the request supplies a string or integer `params._meta.progressToken`,
-the stream sends an initial `notifications/progress`. Handlers can report more:
+the stream sends an initial `notifications/progress` and repeats the latest
+accepted handler message every thirty seconds while the call is running. Before
+the handler reports anything, its message is `working`. Configure the positive
+`progressKeepaliveMs` interval when needed; keep it below the client's idle limit.
+These progress notifications keep clients active when comment heartbeats alone
+do not reset their idle timer. Handlers can report more:
 
 ```ts
 server.register(waitTool, async (args, { progress, signal }) => {
@@ -172,16 +177,50 @@ server.register(waitTool, async (args, { progress, signal }) => {
 });
 ```
 
-Progress uses the current request's token only. Values must be finite,
-nonnegative and strictly increasing; optional totals must be finite and at least
-the progress value. Omitting the value increments the previous value by one.
-Messages are limited to 4096 UTF-8 bytes, JSON-escaped and sent only on that
-request's stream. Under output backpressure updates may be dropped rather than
-queued without bound. Invalid updates, late updates, missing tokens and JSON-only
-requests produce no progress messages; reporting progress never throws into the
-handler. Messages are explicit host output: supply user-safe text, without
-credentials, raw arguments or private diagnostics. Automatic messages include
-none of those values.
+**0.5.0 migration — BREAKING for consumers of raw progress numbers:** the wire
+`progress` is now an activity-notification counter, starting at zero and strictly
+increasing for every emitted handler update or keepalive. A keepalive cannot
+repeat the numeric value: [MCP requires each notification to increase](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/progress).
+Read original work numbers from
+`params._meta['particle-academy/progress'].nativeWork` instead:
+
+```json
+{
+  "unit": "activity-notifications",
+  "origin": "handler",
+  "nativeWork": { "unit": "native-work", "message": "Waiting for approval", "progress": 1, "total": 2 }
+}
+```
+
+The metadata's native numbers are unchanged. With native `p > 0` and total `t`,
+the wire total is `counter / (p / t)`, preserving the displayed `p/t` ratio within
+floating-point precision. At or beyond the native total, the displayed ratio
+clamps to one. With `p = 0`, a positive strictly increasing wire value cannot
+have an exactly zero ratio against a finite total. The wire total is therefore
+`Number.MAX_VALUE`, the largest finite total, giving the smallest positive ratio
+for that counter: `counter / Number.MAX_VALUE`, always below `0.001` throughout
+the safe-integer counter range. If an extreme positive native ratio would require
+an infinite wire total or underflows, omit the wire total and preserve the exact
+native metadata. Message-only updates also omit the total. The total is a
+derived ratio display value, not the original native work-unit count.
+
+Native numbers must be finite and nonnegative. Each numeric handler report must
+strictly exceed the previous accepted numeric handler report, independently of
+message-only updates and keepalives. Non-increasing or invalid reports are
+rejected entirely; they do not replace the last message or metadata. A total
+requires a numeric progress value. The handler's `progress()` returns `void`
+and never throws, including for rejected reports. At most one generic
+`PRISM_MCP_PROGRESS_REJECTED` warning per stream reports rejection or a ratio
+that cannot be displayed; it contains no token, message or numeric payload.
+
+Messages are limited to4096 UTF-8 bytes and JSON-escaped on their own request's
+stream. Supply user-safe host text without credentials, raw arguments or private
+diagnostics: keepalives repeat that text. Under backpressure, skip updates
+without advancing the counter or buffering a queue. Exhausting the safe-integer
+counter stops notifications while the handler continues. Missing or invalid
+tokens retain comment heartbeats, and JSON-only requests receive no progress
+notifications. Both timers stop on result, error, cancellation, disconnect or
+shutdown. No progress is emitted after the call ends.
 
 HTTP tool contexts receive an `AbortSignal`. An authenticated
 `notifications/cancelled` with `params.requestId` signals the matching active

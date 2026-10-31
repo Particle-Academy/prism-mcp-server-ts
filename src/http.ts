@@ -13,6 +13,8 @@ export interface LoopbackHttpOptions {
   maxRequestBytes?: number;
   /** SSE comment cadence for opted-in tools/call requests. Defaults to ten seconds. */
   heartbeatIntervalMs?: number;
+  /** Token-bearing SSE tool calls repeat progress at this cadence. Defaults to thirty seconds. */
+  progressKeepaliveMs?: number;
   /** Opt in to cancelling work when its response connection drops. Default false. */
   abortOnDisconnect?: boolean;
 }
@@ -36,6 +38,7 @@ export class LoopbackHttpTransport implements ServerTransport {
   readonly #configuredOrigins?: readonly string[];
   readonly #maxRequestBytes: number;
   readonly #heartbeatIntervalMs: number;
+  readonly #progressKeepaliveMs: number;
   readonly #abortOnDisconnect: boolean;
   readonly #calls = new Map<string | number, Set<{ controller: AbortController; detach: () => void }>>();
   readonly #streams = new Set<{ response: ServerResponse; stop: () => void }>();
@@ -51,10 +54,12 @@ export class LoopbackHttpTransport implements ServerTransport {
     this.#configuredOrigins = options.allowedOrigins?.slice();
     this.#maxRequestBytes = options.maxRequestBytes ?? 1024 * 1024;
     this.#heartbeatIntervalMs = options.heartbeatIntervalMs ?? 10000;
+    this.#progressKeepaliveMs = options.progressKeepaliveMs ?? 30000;
     this.#abortOnDisconnect = options.abortOnDisconnect ?? false;
     if (!Number.isInteger(this.#port) || this.#port < 0 || this.#port > 65535
       || !Number.isSafeInteger(this.#maxRequestBytes) || this.#maxRequestBytes <= 0
       || !Number.isSafeInteger(this.#heartbeatIntervalMs) || this.#heartbeatIntervalMs < 1 || this.#heartbeatIntervalMs > 2147483647
+      || !Number.isSafeInteger(this.#progressKeepaliveMs) || this.#progressKeepaliveMs < 1 || this.#progressKeepaliveMs > 2147483647
       || typeof this.#abortOnDisconnect !== 'boolean') {
       throw new McpError('protocol_failure', 'Invalid HTTP transport limits.');
     }
@@ -242,10 +247,14 @@ export class LoopbackHttpTransport implements ServerTransport {
       'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' });
     response.flushHeaders();
     response.write(': open\n\n');
-    let active = true, timer: ReturnType<typeof setInterval> | undefined, last = -1;
+    let active = true, timer: ReturnType<typeof setInterval> | undefined;
+    let progressTimer: ReturnType<typeof setInterval> | undefined;
+    let last = -1, lastNative = -1, warned = false;
+    let native: { unit: string; message: string; progress?: number; total?: number } = { unit: 'native-work', message: 'working' };
     const stream = { response, stop: (): void => {
       active = false;
       if (timer !== undefined) { clearInterval(timer); timer = undefined; }
+      if (progressTimer !== undefined) { clearInterval(progressTimer); progressTimer = undefined; }
       this.#streams.delete(stream);
       response.removeListener('close', stream.stop);
       request.signal?.removeEventListener('abort', onCancel);
@@ -259,23 +268,54 @@ export class LoopbackHttpTransport implements ServerTransport {
     const meta = request.params?._meta;
     const token = isJsonObject(meta) ? meta.progressToken : undefined;
     const hasToken = typeof token === 'string' || (typeof token === 'number' && Number.isFinite(token) && Number.isInteger(token));
+    const warn = (): void => {
+      // One generic diagnostic per stream: no token, message, arguments or numbers.
+      if (warned) return; warned = true;
+      try { process.emitWarning('Invalid, non-increasing or unrepresentable native tool progress was ignored for wire display.', { code: 'PRISM_MCP_PROGRESS_REJECTED' }); }
+      catch { /* A diagnostic sink cannot fail the tool. */ }
+    };
+    const notify = (work: typeof native, origin: string): boolean => {
+      if (!hasToken || !writable() || response.writableNeedDrain || last >= Number.MAX_SAFE_INTEGER) return false;
+      const next = last + 1;
+      let total: number | undefined;
+      if (work.progress !== undefined && work.total !== undefined) {
+        if (work.progress === 0) total = Number.MAX_VALUE;
+        else if (work.progress >= work.total) total = next;
+        else {
+          const scaled = next / (work.progress / work.total);
+          if (Number.isFinite(scaled) && scaled >= next) total = scaled;
+          else warn(); // Preserve native metadata; an impossible finite ratio is indeterminate.
+        }
+      }
+      const params: JsonValue = { progressToken: token as string | number, progress: next,
+        ...(total === undefined ? {} : { total }), message: work.message,
+        _meta: { 'particle-academy/progress': { unit: 'activity-notifications', origin, nativeWork: { ...work } } } };
+      event({ jsonrpc: '2.0', method: 'notifications/progress', params }); last = next;
+      return true;
+    };
     const progress: ToolProgress = (message, amount, total): void => {
       try {
         if (!hasToken || !writable() || response.writableNeedDrain || typeof message !== 'string') return;
-        const next = amount ?? last + 1;
-        if (!Number.isFinite(next) || next < 0 || next <= last
-          || (total !== undefined && (!Number.isFinite(total) || total < next))) return;
-        const params: JsonValue = { progressToken: token as string | number, progress: next,
-          ...(total === undefined ? {} : { total }), message: boundedMessage(message) };
-        event({ jsonrpc: '2.0', method: 'notifications/progress', params }); last = next;
+        if ((amount !== undefined && (!Number.isFinite(amount) || amount < 0 || amount <= lastNative))
+          || (total !== undefined && (amount === undefined || !Number.isFinite(total) || total < 0))) { warn(); return; }
+        const work = { unit: 'native-work', message: boundedMessage(message),
+          ...(amount === undefined ? {} : { progress: amount }), ...(total === undefined ? {} : { total }) };
+        if (notify(work, 'handler')) { native = work; if (amount !== undefined) lastNative = amount; }
       } catch { /* Best-effort progress never throws into a tool handler. */ }
     };
-    progress('Tool call started.', 0);
+    try { notify(native, 'start'); } catch { /* Progress is best effort before handler dispatch too. */ }
     timer = setInterval(() => {
       if (!writable()) { stream.stop(); return; }
       if (!response.writableNeedDrain) response.write(': heartbeat\n\n');
     }, this.#heartbeatIntervalMs);
     timer.unref();
+    if (hasToken) {
+      progressTimer = setInterval(() => {
+        if (!writable()) { stream.stop(); return; }
+        try { notify(native, 'keepalive'); } catch { /* Closed or failed output never fails the handler. */ }
+      }, this.#progressKeepaliveMs);
+      progressTimer.unref();
+    }
     try {
       const result = await handler({ ...request, progress });
       if (writable()) event({ jsonrpc: '2.0', id, result });

@@ -42,15 +42,99 @@ function messages(text: string): JsonObject[] {
   return text.split('\n\n').filter(part => part.startsWith('event: message\n')).map(part => JSON.parse(part.slice('event: message\ndata: '.length)) as JsonObject);
 }
 
+const progressParams = (text: string): JsonObject[] => messages(text)
+  .filter(event => event.method === 'notifications/progress').map(event => event.params as JsonObject);
+const nativeWork = (params: JsonObject): JsonObject =>
+  ((params._meta as JsonObject)['particle-academy/progress'] as JsonObject).nativeWork as JsonObject;
+
+it('progress keepalive emits every default thirty seconds beyond thirty minutes and cleans both timers', async () => {
+  vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'Date'] });
+  const f = await fixture(), wire = call(f.url, f.token); await f.started; await wire.first;
+  await vi.advanceTimersByTimeAsync(2100000); f.finish();
+  const params = progressParams(await wire.done);
+  expect(params).toHaveLength(71);
+  expect(params.map(p => p.progress)).toEqual(Array.from({ length: 71 }, (_, i) => i));
+  expect(params.every(p => p.message === 'working' && p.total === undefined)).toBe(true);
+  expect(params.every(p => nativeWork(p).message === 'working')).toBe(true);
+  expect(vi.getTimerCount()).toBe(0); const before = wire.text();
+  await vi.advanceTimersByTimeAsync(2100000); expect(wire.text()).toBe(before);
+});
+
+it('progress keepalive preserves native ratios and zero epsilon across fractional and completed work', async () => {
+  vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'Date'] });
+  const f = await fixture(), wire = call(f.url, f.token); await f.started; await wire.first;
+  const reports = [[0, 1], [0.00001, 1], [1.001, 10], [1.0011, 10], [5, 5], [6, 5]];
+  for (const [p, t] of reports) { f.progress('native work', p, t); await vi.advanceTimersByTimeAsync(30000); }
+  f.finish(); const params = progressParams(await wire.done);
+  expect(params).toHaveLength(13);
+  expect(params.map(p => p.progress)).toEqual(Array.from({ length: 13 }, (_, i) => i));
+  for (let i = 0; i < reports.length; i++) for (const row of params.slice(1 + 2 * i, 3 + 2 * i)) {
+    const [p, t] = reports[i]; expect(nativeWork(row)).toEqual({ unit: 'native-work', message: 'native work', progress: p, total: t });
+    const ratio = (row.progress as number) / (row.total as number);
+    expect(Number.isFinite(row.total)).toBe(true);
+    if (p === 0) { expect(ratio).toBeGreaterThan(0); expect(ratio).toBeLessThan(0.001); }
+    else expect(ratio).toBeCloseTo(Math.min(p / t, 1), 14);
+  }
+});
+
+it('progress keepalive keeps one counter through mixed messages and independently rejects stale native work', async () => {
+  vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'Date'] });
+  const warning = vi.spyOn(process, 'emitWarning').mockImplementation(() => {});
+  const f = await fixture(), wire = call(f.url, f.token); await f.started; await wire.first;
+  f.progress('message only'); await vi.advanceTimersByTimeAsync(30000);
+  f.progress('zero work', 0, 1); await vi.advanceTimersByTimeAsync(30000);
+  f.progress('fractional work', 0.001, 1); f.progress('new message');
+  expect(f.progress('private rejected message', 0.001, 1)).toBeUndefined();
+  expect(f.progress('private backwards message', 0, 1)).toBeUndefined();
+  f.progress('more work', 0.0011, 1); f.finish();
+  const text = await wire.done, params = progressParams(text);
+  expect(params.map(p => p.progress)).toEqual([0, 1, 2, 3, 4, 5, 6, 7]);
+  expect(params[6].total).toBeUndefined(); expect(nativeWork(params[6])).toEqual({ unit: 'native-work', message: 'new message' });
+  expect(nativeWork(params[7]).progress).toBe(0.0011); expect(text).not.toContain('private rejected');
+  expect(warning).toHaveBeenCalledTimes(1); expect(JSON.stringify(warning.mock.calls)).not.toContain('private');
+});
+
+it('progress keepalive skips backpressure without consuming counters or accepting blocked native updates', async () => {
+  vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'Date'] });
+  const f = await fixture(), wire = call(f.url, f.token); await f.started; await wire.first;
+  const drain = vi.spyOn(http.ServerResponse.prototype, 'writableNeedDrain', 'get').mockReturnValue(true);
+  f.progress('blocked native work', 1, 10); await vi.advanceTimersByTimeAsync(90000); drain.mockRestore();
+  f.progress('resumed', 1, 10); await vi.advanceTimersByTimeAsync(30000); f.finish();
+  const text = await wire.done, params = progressParams(text);
+  expect(params.map(p => p.progress)).toEqual([0, 1, 2]); expect(text).not.toContain('blocked native');
+  expect(nativeWork(params[2])).toEqual({ unit: 'native-work', message: 'resumed', progress: 1, total: 10 });
+  expect(vi.getTimerCount()).toBe(0);
+});
+
+it('progress keepalive validates its cadence and stops on disconnect', async () => {
+  for (const progressKeepaliveMs of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 2147483648]) {
+    expect(() => new LoopbackHttpTransport({ progressKeepaliveMs })).toThrow();
+  }
+  vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'Date'] });
+  const f = await fixture({ progressKeepaliveMs: 1000 }), wire = call(f.url, f.token); await f.started; await wire.first;
+  await vi.advanceTimersByTimeAsync(2000); wire.request.destroy(); await delay(20);
+  expect(progressParams(wire.text())).toHaveLength(3); expect(vi.getTimerCount()).toBe(0);
+  const before = wire.text(); await vi.advanceTimersByTimeAsync(2100000); expect(wire.text()).toBe(before); f.finish();
+});
+
+it('progress keepalive never serializes a nonfinite total for unrepresentable native ratios', async () => {
+  const warning = vi.spyOn(process, 'emitWarning').mockImplementation(() => {});
+  const f = await fixture(), wire = call(f.url, f.token); await f.started; await wire.first;
+  f.progress('extreme ratio', Number.MIN_VALUE, Number.MAX_VALUE); f.finish();
+  const params = progressParams(await wire.done); expect(params).toHaveLength(2);
+  expect(params[1].total).toBeUndefined();
+  expect(nativeWork(params[1])).toEqual({ unit: 'native-work', message: 'extreme ratio', progress: Number.MIN_VALUE, total: Number.MAX_VALUE });
+  expect(warning).toHaveBeenCalledTimes(1);
+});
+
 it.each([70000, 330000, 960000, 2100000])('streams immediately and keeps a %i ms tool alive with only heartbeat comments', async duration => {
   vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'Date'] });
-  const f = await fixture(), wire = call(f.url, f.token); await f.started;
+  const f = await fixture(), wire = call(f.url, f.token, 'application/json, text/event-stream', Symbol('missing')); await f.started;
   expect(await Promise.race([wire.first.then(() => true), delay(500).then(() => false)])).toBe(true);
   expect(wire.headers()['content-type']).toBe('text/event-stream'); expect(wire.text()).toContain(': open\n\n');
   await vi.advanceTimersByTimeAsync(duration); f.finish(); const text = await wire.done;
   expect(text.match(/: heartbeat\n\n/g)).toHaveLength(duration / 10000);
   expect(messages(text)).toEqual([
-    { jsonrpc: '2.0', method: 'notifications/progress', params: { progressToken: 'progress-fixture', progress: 0, message: 'Tool call started.' } },
     { jsonrpc: '2.0', id: 'call', result: { content: [{ type: 'text', text: 'complete' }], isError: false } },
   ]);
   expect(vi.getTimerCount()).toBe(0);
@@ -58,12 +142,13 @@ it.each([70000, 330000, 960000, 2100000])('streams immediately and keeps a %i ms
 
 it('forwards bounded, increasing token progress without injecting SSE fields', async () => {
   const f = await fixture(), wire = call(f.url, f.token); await f.started; await wire.first;
-  f.progress('first', 1, 10); f.progress('stale', 1); f.progress('invalid', Number.NaN); f.progress('bad-total', 2, 1);
+  f.progress('first', 1, 10); f.progress('stale', 1); f.progress('invalid', Number.NaN); f.progress('bad-total', 2, -1);
   f.progress('😀'.repeat(10000), 2, 10); f.progress('automatic'); f.progress('small\n\nevent: forged\ndata: {}', 4); f.finish();
   const events = messages(await wire.done), progress = events.filter(event => event.method === 'notifications/progress').map(event => event.params as JsonObject);
   expect(progress.map(value => value.progress)).toEqual([0, 1, 2, 3, 4]);
   expect(progress.every(value => value.progressToken === 'progress-fixture')).toBe(true);
   expect(Buffer.byteLength(progress[2].message as string)).toBeLessThanOrEqual(4096);
+  expect(progress[2].message).toBe('😀'.repeat(1024));
   expect(events.at(-1)).toHaveProperty('result');
   expect(events).toHaveLength(6);
   const before = wire.text(); expect(() => f.progress('late', 5)).not.toThrow(); await delay(5); expect(wire.text()).toBe(before);
@@ -86,7 +171,7 @@ it.each(['application/json', 'text/event-stream'])('cleans heartbeat timers on %
   vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'Date'] });
   const f = await fixture(), wire = call(f.url, f.token, accept); await f.started;
   if (accept === 'text/event-stream') await wire.first;
-  expect(vi.getTimerCount()).toBe(accept === 'text/event-stream' ? 1 : 0); wire.request.destroy(); await delay(20);
+  expect(vi.getTimerCount()).toBe(accept === 'text/event-stream' ? 2 : 0); wire.request.destroy(); await delay(20);
   expect(vi.getTimerCount()).toBe(0); expect(f.signal()?.aborted).toBe(false); expect(() => f.progress('disconnected', 1)).not.toThrow(); f.finish();
 });
 
