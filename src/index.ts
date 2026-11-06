@@ -62,7 +62,7 @@ const CLIENT_INFO = 'io.modelcontextprotocol/clientInfo';
 const SERVER_INFO = 'io.modelcontextprotocol/serverInfo';
 const PREFIX = 'mcp-param-';
 const SERVER_NAME = '@particle-academy/prism-mcp-server';
-const SERVER_VERSION = '0.5.0';
+const SERVER_VERSION = '0.6.0';
 
 // The handshake revisions, served for clients that open with `initialize`
 // (Codex's MCP client always does: prism-mcp-server-ts#1). Newest first; an
@@ -87,8 +87,8 @@ export class Server {
 
   constructor(readonly options: ServerOptions) {
     this.#gate = options.gate ?? allowAll;
-    // The client frames provenance. Server defaults preserve text identity and cap bytes.
-    this.#guard = options.guard ?? new ResultGuard({ frameProvenance: false });
+    // Keep the serving limit independent of client defaults; clients frame provenance.
+    this.#guard = options.guard ?? new ResultGuard({ maxBytes: 65_536, frameProvenance: false });
   }
 
   register(definition: ToolDefinition, handler: ToolHandler, options: RegisterOptions = {}): void {
