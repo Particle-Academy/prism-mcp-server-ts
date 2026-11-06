@@ -3,10 +3,10 @@ import { randomBytes } from 'node:crypto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   Client, KNOWN_PROTOCOL_VERSIONS, LATEST_PROTOCOL_VERSION,
-  ToolDefinition as ClientToolDefinition, TrustPolicy,
+  ToolDefinition as ClientToolDefinition, ResultGuard as ClientResultGuard, TrustPolicy,
 } from '@particle-academy/prism-mcp';
 import {
-  Server, InMemoryTransport, ToolDefinition, ResultGuard, McpError,
+  Server, InMemoryTransport, ToolDefinition, ResultGuard, McpError, TrustPolicy as ServerTrustPolicy,
   type JsonObject, type McpToolResult, type ServerOptions, type ToolHandler, type TransportRequest,
 } from '../src/index.js';
 
@@ -205,6 +205,49 @@ describe('handlers, gates, caps and protocol errors', () => {
     server.register(definition(), () => ({ text: 'x'.repeat(65537), isError }));
     await expect(transport.request(request('tools/call', { name: 'echo' }))).rejects.toMatchObject({ code: 'result_too_large' });
     await server.close();
+  });
+  it.each([false, true])('keeps the server cap independent of the client default (isError=%s)', async isError => {
+      const { server, transport } = await setup();
+      const text = 'x'.repeat(65_536);
+      expect(new ClientResultGuard({ frameProvenance: false }).guard('fixture', 'echo', text + 'x')).toBe(text + 'x');
+      server.register(definition(), args => ({ text: String(args.text), isError }));
+      expect(await transport.request(request('tools/call', { name: 'echo', arguments: { text } })))
+        .toEqual({ content: [{ type: 'text', text }], isError, ...RESULT_META });
+      await expect(transport.request(request('tools/call', { name: 'echo', arguments: { text: text + 'x' } })))
+        .rejects.toMatchObject({ code: 'result_too_large' });
+      await server.close();
+  });
+  it.each([false, true])('pins the default UTF-8 byte boundary (isError=%s)', async isError => {
+    const { server, transport } = await setup();
+    server.register(definition(), args => ({ text: String(args.text), isError }));
+    const text = 'é'.repeat(32_768);
+    expect(await transport.request(request('tools/call', { name: 'echo', arguments: { text } })))
+      .toEqual({ content: [{ type: 'text', text }], isError, ...RESULT_META });
+    await expect(transport.request(request('tools/call', { name: 'echo', arguments: { text: text + 'é' } })))
+      .rejects.toMatchObject({ code: 'result_too_large' });
+    await server.close();
+  });
+  it.each([false, true])('lets callers choose the re-exported guard default (isError=%s)', async isError => {
+    const { server, transport } = await setup({ guard: new ResultGuard({ frameProvenance: false }) });
+    server.register(definition(), args => ({ text: String(args.text), isError }));
+    const text = 'x'.repeat(262_144);
+    expect(await transport.request(request('tools/call', { name: 'echo', arguments: { text } })))
+      .toEqual({ content: [{ type: 'text', text }], isError, ...RESULT_META });
+    await expect(transport.request(request('tools/call', { name: 'echo', arguments: { text: text + 'x' } })))
+      .rejects.toMatchObject({ code: 'result_too_large' });
+    await server.close();
+  });
+  it('re-exports the shared guard with its new 256 KiB default', () => {
+    expect(ResultGuard).toBe(ClientResultGuard);
+    const guard = new ResultGuard({ frameProvenance: false });
+    expect(guard.guard('fixture', 'echo', 'x'.repeat(262_144))).toHaveLength(262_144);
+    expect(() => guard.guard('fixture', 'echo', 'x'.repeat(262_145))).toThrow(McpError);
+  });
+  it('re-exports trust policy and refuses an explicitly empty allowlist', () => {
+    expect(ServerTrustPolicy).toBe(TrustPolicy);
+    expect(() => ServerTrustPolicy.allowing([]).admit('fixture', []))
+      .toThrow(expect.objectContaining({ code: 'server_not_trusted' }));
+    expect(ServerTrustPolicy.allowingEveryTool().admit('fixture', [])).toEqual([]);
   });
   it('counts UTF-8 bytes rather than characters', async () => {
     const { server, transport } = await setup({ guard: new ResultGuard({ maxBytes: 4, frameProvenance: false }) });
