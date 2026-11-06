@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.6.0
 
 - **Breaking:** re-exported `TrustPolicy.allowing([])` now raises
   `server_not_trusted`; a `ResultGuard` you construct without `maxBytes` now
