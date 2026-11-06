@@ -30,7 +30,7 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@particle-academy/prism-mcp": "0.3.0"
+    "@particle-academy/prism-mcp": "0.4.0"
   },
   "devDependencies": {
     "@types/node": "^26.3.0",

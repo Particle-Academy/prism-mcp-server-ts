@@ -87,8 +87,8 @@ export class Server {
 
   constructor(readonly options: ServerOptions) {
     this.#gate = options.gate ?? allowAll;
-    // The client frames provenance. Server defaults preserve text identity and cap bytes.
-    this.#guard = options.guard ?? new ResultGuard({ frameProvenance: false });
+    // Keep the serving limit independent of client defaults; clients frame provenance.
+    this.#guard = options.guard ?? new ResultGuard({ maxBytes: 65_536, frameProvenance: false });
   }
 
   register(definition: ToolDefinition, handler: ToolHandler, options: RegisterOptions = {}): void {
