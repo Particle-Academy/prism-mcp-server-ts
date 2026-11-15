@@ -19,6 +19,26 @@ A request carrying any stateless `_meta` key is held to the stateless rules.
 Bearer and Origin checks, request limits, the gate and the result guard apply
 to both protocols in the same way.
 
+`SUPPORTED_PROTOCOL_VERSIONS` lists every version served, newest first, and
+`protocol-versions.json` publishes the same list.
+
+## Server instructions
+
+```ts
+const server = new Server({
+  server: 'journal',
+  transport,
+  instructions: 'Search the journal before reading an entry by id.',
+});
+```
+
+`instructions` is guidance a client may give its model, for example in its
+system prompt. It is sent in the `initialize` result and the `server/discover`
+result. Because it reaches the model, it comes only from your own
+configuration: it is fixed when the server is constructed, and nothing a
+request or a tool sends can set or change it. It must be a non-empty string of
+at most 16 KiB.
+
 ## Per-request tool visibility
 
 `register(definition, handler, { visible })` takes an optional predicate that

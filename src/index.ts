@@ -54,7 +54,17 @@ export interface ServerOptions {
   transport: ServerTransport;
   gate?: ToolGate;
   guard?: ResultGuard;
+  /**
+   * The server's `instructions`: natural-language guidance a client may give its model, for example in the system
+   * prompt (G-277). Sent in the `initialize` result and the `server/discover` result. Reaches the model as guidance,
+   * so it comes from the embedder's own configuration and is fixed at construction; nothing a tool or a request
+   * sends can set or change it. A non-empty string of at most 16 KiB.
+   */
+  instructions?: string;
 }
+
+/** Instructions are guidance for a model, not a document: bounded so one option cannot become a token sink. */
+const MAX_INSTRUCTIONS_BYTES = 16_384;
 
 const VERSION = 'io.modelcontextprotocol/protocolVersion';
 const CAPABILITIES = 'io.modelcontextprotocol/clientCapabilities';
@@ -62,12 +72,19 @@ const CLIENT_INFO = 'io.modelcontextprotocol/clientInfo';
 const SERVER_INFO = 'io.modelcontextprotocol/serverInfo';
 const PREFIX = 'mcp-param-';
 const SERVER_NAME = '@particle-academy/prism-mcp-server';
-const SERVER_VERSION = '0.6.0';
+const SERVER_VERSION = '0.7.0';
 
 // The handshake revisions, served for clients that open with `initialize`
 // (Codex's MCP client always does: prism-mcp-server-ts#1). Newest first; an
 // unknown requested revision is answered with the first, as the spec says.
 const CLASSIC_VERSIONS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'] as const;
+
+/**
+ * Every MCP protocol version this server serves, newest first: the stateless revision, then the handshake revisions.
+ * The standing rule is that the five newest official versions are always here; protocol-versions.json publishes this
+ * list for the drift watcher, and a test keeps the two identical.
+ */
+export const SUPPORTED_PROTOCOL_VERSIONS: readonly string[] = Object.freeze([LATEST_PROTOCOL_VERSION, ...CLASSIC_VERSIONS]);
 const STATELESS_KEYS = [VERSION, CAPABILITIES, CLIENT_INFO];
 
 interface RegisteredTool {
@@ -83,9 +100,11 @@ export class Server {
   readonly #refused = new Set<string>();
   readonly #gate: ToolGate;
   readonly #guard: ResultGuard;
+  readonly #instructions: string | undefined;
   #closed = false;
 
   constructor(readonly options: ServerOptions) {
+    this.#instructions = instructionsOf(options.instructions);
     this.#gate = options.gate ?? allowAll;
     // Keep the serving limit independent of client defaults; clients frame provenance.
     this.#guard = options.guard ?? new ResultGuard({ maxBytes: 65_536, frameProvenance: false });
@@ -127,6 +146,7 @@ export class Server {
     // an agreed revision. HTTP bearer/Origin checks still run in the transport.
     if (request.method === 'server/discover') {
       return complete({ supportedVersions: [LATEST_PROTOCOL_VERSION], capabilities: { tools: {} },
+        ...(this.#instructions === undefined ? {} : { instructions: this.#instructions }),
         ttlMs: 0, cacheScope: 'private' });
     }
     const params = request.params ?? {};
@@ -153,7 +173,7 @@ export class Server {
    */
   async #classic(request: TransportRequest, params: JsonObject): Promise<JsonValue> {
     if (request.method.startsWith('notifications/')) return null;
-    if (request.method === 'initialize') return initialize(params);
+    if (request.method === 'initialize') return initialize(params, this.#instructions);
     const header = request.headers?.['mcp-protocol-version'];
     if (header !== undefined && !CLASSIC_VERSIONS.some((version) => version === header)) {
       throw new McpError('unsupported_protocol_version',
@@ -259,7 +279,15 @@ function assertProtocol(params: JsonObject): void {
   }
 }
 
-function initialize(params: JsonObject): JsonObject {
+function instructionsOf(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string' || value.trim() === '' || Buffer.byteLength(value, 'utf8') > MAX_INSTRUCTIONS_BYTES) {
+    throw new McpError('protocol_failure', `Server instructions must be a non-empty string of at most ${MAX_INSTRUCTIONS_BYTES} bytes.`);
+  }
+  return value;
+}
+
+function initialize(params: JsonObject, instructions: string | undefined): JsonObject {
   if (typeof params.protocolVersion !== 'string'
     || (params.capabilities !== undefined && !isJsonObject(params.capabilities))
     || (params.clientInfo !== undefined && !isJsonObject(params.clientInfo))) {
@@ -267,7 +295,8 @@ function initialize(params: JsonObject): JsonObject {
   }
   const requested = params.protocolVersion;
   const protocolVersion = CLASSIC_VERSIONS.find((version) => version === requested) ?? CLASSIC_VERSIONS[0];
-  return { protocolVersion, capabilities: { tools: {} }, serverInfo: { name: SERVER_NAME, version: SERVER_VERSION } };
+  return { protocolVersion, capabilities: { tools: {} }, serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
+    ...(instructions === undefined ? {} : { instructions }) };
 }
 
 function complete(result: JsonObject): JsonObject {
