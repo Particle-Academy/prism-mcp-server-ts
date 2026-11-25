@@ -95,10 +95,26 @@ Custom guards may intentionally transform results.
 Only `Mcp-Param-*` request headers reach handlers: the prefix is required and
 stripped case-insensitively, and context header keys are lowercase. Raw
 `Authorization`, `Cookie`, `Origin` and other non-parameter headers stay private.
-Shared `MirroredParameters` annotations resolve these headers into arguments
-before gating; nested string/integer/boolean fields are supported. Ambiguous
-headers, invalid primitive encodings and conflicting body/header values fail
-closed. Handlers validate the rest of their own application arguments.
+Handlers validate the rest of their own application arguments.
+
+Headers that mirror the request body are checked against it before the gate and
+the tool, as the 2026-07-28 Streamable HTTP transport specifies. The body is the
+only source of a call's arguments; a header never adds one.
+
+- Each `Mcp-Param-*` header is decoded (`=?base64?...?=`) and must equal the body
+  value at its `x-mcp-header` path. Integers compare by value (`3.0` is `3`).
+- A header the tool does not declare, a header for a value the body does not
+  carry, a repeated or malformed header, and a header that disagrees with the
+  body are all refused.
+- On 2026-07-28 over HTTP, every mirrored value in the body needs its header. The
+  handshake revisions define no mirrored headers, so none is required there, and
+  any that are sent are still checked. `InMemoryTransport` requires none either; a
+  custom transport opts out with `requiresMirroredHeaders: false`.
+- `Mcp-Method`, `Mcp-Name` and `MCP-Protocol-Version` must match the body when
+  present. They are not yet required.
+- The HTTP transport answers a mismatch with status 400 and JSON-RPC error
+  `-32020` (`HeaderMismatch`), before a streamed call opens its stream. In process
+  it is a `HeaderMismatchError`.
 
 `tools/list` and `tools/call` require `params._meta` with
 `io.modelcontextprotocol/protocolVersion: '2026-07-28'`,

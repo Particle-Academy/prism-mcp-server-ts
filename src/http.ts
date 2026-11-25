@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import http, { type IncomingMessage, type Server as HttpServer, type ServerResponse } from 'node:http';
 import type { Socket } from 'node:net';
 import { McpError, isJsonObject, type JsonValue } from '@particle-academy/prism-mcp';
+import { HEADER_MISMATCH, HeaderMismatchError, REPEATED, isMirrorHeader } from './headers.js';
 import type { ServerTransport, ServerTransportRequest, ToolProgress } from './index.js';
 
 export interface LoopbackHttpOptions {
@@ -65,7 +66,8 @@ export class LoopbackHttpTransport implements ServerTransport {
     }
   }
 
-  async listen(handler: (request: ServerTransportRequest) => Promise<JsonValue>): Promise<{ url: string; token: string }> {
+  async listen(handler: (request: ServerTransportRequest) => Promise<JsonValue>,
+    check?: (request: ServerTransportRequest) => Promise<void>): Promise<{ url: string; token: string }> {
     if (this.#closed || this.#server) throw new McpError('protocol_failure', 'Transport is closed or already listening.');
     const token = this.#configuredToken === undefined ? crypto.randomBytes(32).toString('hex') : this.#configuredToken;
     // Validate before creating any listener; an empty credential must never match.
@@ -86,7 +88,7 @@ export class LoopbackHttpTransport implements ServerTransport {
       return undefined;
     };
     const server = http.createServer({ requestTimeout: 0, headersTimeout: 0, keepAliveTimeout: 0, maxHeaderSize: 16384 }, (request, response) => {
-      void this.#respond(request, response, handler, authorize).catch(() => {
+      void this.#respond(request, response, handler, authorize, check).catch(() => {
         // Transport failures never echo diagnostics, headers, arguments or tokens.
         if (!response.headersSent && !response.destroyed) send(response, 500, rpcError(null, -32603));
         else response.destroy();
@@ -138,7 +140,8 @@ export class LoopbackHttpTransport implements ServerTransport {
 
   async #respond(request: IncomingMessage, response: ServerResponse,
     handler: (request: ServerTransportRequest) => Promise<JsonValue>,
-    authorize: (request: IncomingMessage) => number | undefined): Promise<void> {
+    authorize: (request: IncomingMessage) => number | undefined,
+    check?: (request: ServerTransportRequest) => Promise<void>): Promise<void> {
     const status = authorize(request);
     if (status) { send(response, status, rpcError(null, -32000)); return; }
     if (this.#closed) { send(response, 503, rpcError(null, -32000)); return; }
@@ -154,8 +157,13 @@ export class LoopbackHttpTransport implements ServerTransport {
       send(response, 415, rpcError(null, -32600)); return;
     }
     const headers: Record<string, string> = Object.create(null) as Record<string, string>;
+    // A repeated header that mirrors the body is answered as a header mismatch, which needs the body's id.
+    let repeated = false;
     for (const [name, values] of Object.entries(request.headersDistinct)) {
-      if (values?.length !== 1) { send(response, 400, rpcError(null, -32600)); return; }
+      if (values?.length !== 1) {
+        if (values && values.length > 1 && isMirrorHeader(name)) { repeated = true; continue; }
+        send(response, 400, rpcError(null, -32600)); return;
+      }
       headers[name] = values[0];
     }
     if (headers['transfer-encoding']) { send(response, 400, rpcError(null, -32600)); return; }
@@ -185,6 +193,7 @@ export class LoopbackHttpTransport implements ServerTransport {
     if (accept && body.method !== 'tools/call' && !allows(accept, 'application/json')) {
       send(response, 406, rpcError(null, -32600)); return;
     }
+    if (repeated) { send(response, 400, mismatch(notification ? null : body.id as string | number, new HeaderMismatchError(REPEATED))); return; }
     if (this.#closed || response.destroyed) return;
     if (notification) {
       // Streamable HTTP answers an accepted notification 202 with no body.
@@ -226,12 +235,17 @@ export class LoopbackHttpTransport implements ServerTransport {
       const request = { method: body.method, params: body.params, headers, ...(controller ? { signal: controller.signal } : {}) };
       const sse = allows(accept, 'text/event-stream', true)
         || (allows(accept, 'text/event-stream') && !allows(accept, 'application/json'));
-      if (body.method === 'tools/call' && sse) { await this.#stream(response, request, id, handler); return; }
+      if (body.method === 'tools/call' && sse) {
+        // A stream answers 200 before the tool settles, so a header mismatch is refused before it opens.
+        await check?.(request);
+        await this.#stream(response, request, id, handler); return;
+      }
       const result = await handler(request);
       if (!this.#closed && !response.destroyed && !controller?.signal.aborted) send(response, 200, { jsonrpc: '2.0', id, result });
     } catch (error) {
       if (!this.#closed && !response.destroyed && !controller?.signal.aborted) {
-        send(response, 200, rpcError(id, -32000, error instanceof McpError ? error.code : 'protocol_failure'));
+        if (error instanceof HeaderMismatchError) send(response, 400, mismatch(id, error));
+        else send(response, 200, rpcError(id, -32000, error instanceof McpError ? error.code : 'protocol_failure'));
       }
     } finally {
       call.detach();
@@ -382,6 +396,11 @@ function boundedMessage(message: string): string {
 function rpcError(id: JsonValue, code: number, category?: string): JsonValue {
   return { jsonrpc: '2.0', id, error: { code, message: 'MCP request refused.',
     ...(category ? { data: { code: category } } : {}) } };
+}
+
+/** HTTP 400 with the specification's HeaderMismatch error; the message names a header, never a value. */
+function mismatch(id: JsonValue, error: HeaderMismatchError): JsonValue {
+  return { jsonrpc: '2.0', id, error: { code: HEADER_MISMATCH, message: error.message } };
 }
 
 function accepted(response: ServerResponse): void {
