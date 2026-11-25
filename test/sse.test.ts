@@ -19,8 +19,8 @@ async function fixture(options: ConstructorParameters<typeof LoopbackHttpTranspo
   return { server, ...endpoint, started, signal: () => signal, finish: (value: McpToolResult = { text: 'complete', isError: false }) => finish(value), progress: (message: string, amount?: number, total?: number) => report?.(message, amount, total) };
 }
 
-function call(url: string, token: string | null, accept = 'application/json, text/event-stream', progressToken: unknown = 'progress-fixture', extra: http.OutgoingHttpHeaders = {}, meta: JsonObject = {}) {
-  const body = JSON.stringify({ jsonrpc: '2.0', id: 'call', method: 'tools/call', params: { name: 'wait', arguments: {},
+function call(url: string, token: string | null, accept = 'application/json, text/event-stream', progressToken: unknown = 'progress-fixture', extra: http.OutgoingHttpHeaders = {}, meta: JsonObject = {}, args: JsonObject = {}) {
+  const body = JSON.stringify({ jsonrpc: '2.0', id: 'call', method: 'tools/call', params: { name: 'wait', arguments: args,
     ...(progressToken === undefined ? {} : { _meta: { ...meta, progressToken } }) } });
   let text = '', headers: http.IncomingHttpHeaders = {}, status: number | undefined, opened!: () => void;
   const first = new Promise<void>(resolve => { opened = resolve; });
@@ -236,8 +236,8 @@ it('ignores unauthenticated, malformed, unknown and request-shaped cancellations
 it('does not choose another caller when concurrent clients reuse a request id', async () => {
   const transport = new LoopbackHttpTransport(), server = new Server({ server: 'fixture', transport }); servers.push(server);
   const signals: AbortSignal[] = [], finishes: ((value: McpToolResult) => void)[] = [], reports = new Map<string, ToolProgress>();
-  server.register(new ToolDefinition('wait', '', {}), (_args, context) => { signals.push(context.signal!); reports.set(context.headers.client, context.progress!); return new Promise(resolve => finishes.push(resolve)); });
-  const endpoint = await server.listen(), a = call(endpoint.url, endpoint.token, 'text/event-stream', 'a-token', { 'Mcp-Param-client': 'a' }), b = call(endpoint.url, endpoint.token, 'text/event-stream', 'b-token', { 'Mcp-Param-client': 'b' }); await Promise.all([a.first, b.first]);
+  server.register(new ToolDefinition('wait', '', { properties: { client: { type: 'string', 'x-mcp-header': 'client' } } }), (_args, context) => { signals.push(context.signal!); reports.set(context.headers.client, context.progress!); return new Promise(resolve => finishes.push(resolve)); });
+  const endpoint = await server.listen(), a = call(endpoint.url, endpoint.token, 'text/event-stream', 'a-token', { 'Mcp-Param-client': 'a' }, {}, { client: 'a' }), b = call(endpoint.url, endpoint.token, 'text/event-stream', 'b-token', { 'Mcp-Param-client': 'b' }, {}, { client: 'b' }); await Promise.all([a.first, b.first]);
   expect(await cancel(endpoint.url, endpoint.token)).toBe(202); expect(signals.map(signal => signal.aborted)).toEqual([false, false]);
   reports.get('a')!('only-a', 1); reports.get('b')!('only-b', 1);
   for (const finish of finishes) finish({ text: 'done', isError: false }); await Promise.all([a.done, b.done]);

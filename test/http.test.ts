@@ -216,7 +216,8 @@ it('preserves pins, namespaced mirrors and credential isolation over real HTTP',
   const tools = (list.body.result as { tools: JsonObject[] }).tools;
   expect(ToolDefinition.fromPayload(tools[0]).digest()).toBe(tool.digest());
   for (const mirror of [false, true]) {
-    const reply = await send(url, token, { Cookie: 'PRIVATE-COOKIE', ...(mirror ? { 'Mcp-Param-authorization': 'public' } : {}) }, rpc('tools/call', { name: 'mirror' }));
+    const reply = await send(url, token, { Cookie: 'PRIVATE-COOKIE', ...(mirror ? { 'Mcp-Param-authorization': 'public' } : {}) },
+      rpc('tools/call', { name: 'mirror', ...(mirror ? { arguments: { value: 'public' } } : {}) }));
     expect(handler.mock.calls.at(-1)![0]).toEqual(mirror ? { value: 'public' } : {});
     expect(handler.mock.calls.at(-1)![1].headers).toEqual(mirror ? { authorization: 'public' } : {});
     expect(JSON.stringify(reply.body)).not.toContain(token);

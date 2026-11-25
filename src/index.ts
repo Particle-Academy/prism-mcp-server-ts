@@ -1,3 +1,4 @@
+import { checkMirroredHeaders, checkStandardHeaders, headerView } from './headers.js';
 import {
   KNOWN_PROTOCOL_VERSIONS,
   LATEST_PROTOCOL_VERSION,
@@ -21,6 +22,7 @@ export { TrustPolicy } from '@particle-academy/prism-mcp';
 export { McpError, MirroredParameters, ResultGuard, ToolDefinition, allowAll };
 export type { JsonObject, JsonValue, McpErrorCode, McpToolResult, ToolGate, TransportRequest };
 export { LoopbackHttpTransport, type LoopbackHttpOptions } from './http.js';
+export { HEADER_MISMATCH, HeaderMismatchError } from './headers.js';
 
 export type ToolProgress = (message: string, progress?: number, total?: number) => void;
 /** Optional transport-owned reply channel; shared request fields remain the sibling's. */
@@ -45,8 +47,20 @@ export interface RegisterOptions {
 }
 
 export interface ServerTransport {
-  listen(handler: (request: ServerTransportRequest) => Promise<JsonValue>): Promise<{ url: string; token: string | null }>;
+  /**
+   * `check`, when given, runs the header checks alone and throws `HeaderMismatchError` for a request whose headers
+   * disagree with its body. A transport that commits to a response before the handler settles (an event stream)
+   * calls it first, so the refusal can still be an HTTP 400.
+   */
+  listen(handler: (request: ServerTransportRequest) => Promise<JsonValue>,
+    check?: (request: ServerTransportRequest) => Promise<void>): Promise<{ url: string; token: string | null }>;
   close(): Promise<void>;
+  /**
+   * Whether requests arrive with HTTP headers, so a 2026-07-28 tools/call must carry an `Mcp-Param-*` header for
+   * every mirrored value in its body. Absent means true: a transport opts OUT, so a custom HTTP transport is held to
+   * the rule by default. Headers that ARE present are checked against the body on every transport and revision.
+   */
+  readonly requiresMirroredHeaders?: boolean;
 }
 
 export interface ServerOptions {
@@ -70,7 +84,6 @@ const VERSION = 'io.modelcontextprotocol/protocolVersion';
 const CAPABILITIES = 'io.modelcontextprotocol/clientCapabilities';
 const CLIENT_INFO = 'io.modelcontextprotocol/clientInfo';
 const SERVER_INFO = 'io.modelcontextprotocol/serverInfo';
-const PREFIX = 'mcp-param-';
 const SERVER_NAME = '@particle-academy/prism-mcp-server';
 const SERVER_VERSION = '0.7.0';
 
@@ -101,11 +114,13 @@ export class Server {
   readonly #gate: ToolGate;
   readonly #guard: ResultGuard;
   readonly #instructions: string | undefined;
+  readonly #requireHeaders: boolean;
   #closed = false;
 
   constructor(readonly options: ServerOptions) {
     this.#instructions = instructionsOf(options.instructions);
     this.#gate = options.gate ?? allowAll;
+    this.#requireHeaders = options.transport.requiresMirroredHeaders !== false;
     // Keep the serving limit independent of client defaults; clients frame provenance.
     this.#guard = options.guard ?? new ResultGuard({ maxBytes: 65_536, frameProvenance: false });
   }
@@ -132,7 +147,7 @@ export class Server {
 
   listen(): Promise<{ url: string; token: string | null }> {
     this.#assertOpen();
-    return this.options.transport.listen((request) => this.handle(request));
+    return this.options.transport.listen((request) => this.handle(request), (request) => this.#check(request));
   }
 
   async close(): Promise<void> {
@@ -142,6 +157,11 @@ export class Server {
 
   async handle(request: ServerTransportRequest): Promise<JsonValue> {
     this.#assertOpen();
+    const params = request.params ?? {};
+    const stateless = isStateless(params);
+    // Headers that mirror the body are checked against it before anything else reads either.
+    const headers = headerView(request.headers);
+    checkStandardHeaders(headers, request.method, params, stateless);
     // Discovery precedes version selection: it cannot require the metadata of
     // an agreed revision. HTTP bearer/Origin checks still run in the transport.
     if (request.method === 'server/discover') {
@@ -149,12 +169,7 @@ export class Server {
         ...(this.#instructions === undefined ? {} : { instructions: this.#instructions }),
         ttlMs: 0, cacheScope: 'private' });
     }
-    const params = request.params ?? {};
-    // A request carrying ANY stateless metadata key is a stateless request and
-    // is held to the stateless rules; only one with none of them is classic. A
-    // half-formed stateless request must not fall through to the classic path.
-    const classic = !(isJsonObject(params._meta) && STATELESS_KEYS.some((key) => Object.hasOwn(params._meta as JsonObject, key)));
-    if (classic) return this.#classic(request, params);
+    if (!stateless) return this.#classic(request, params, headers);
     assertProtocol(params);
     if (request.method === 'tools/list') {
       return complete({ tools: (await this.#listed(request)).map(withoutNulls), ttlMs: 0, cacheScope: 'private' });
@@ -162,7 +177,27 @@ export class Server {
     if (request.method !== 'tools/call') {
       throw new McpError('protocol_failure', 'Only server/discover, tools/list and tools/call are supported on the stateless revision.');
     }
-    return complete(await this.#call(request, params));
+    return complete(await this.#call(request, params, headers, true));
+  }
+
+  /**
+   * The header checks alone, for a transport that must refuse before it commits to a response. Throws only
+   * HeaderMismatchError; any other fault is left for handle() to report as it always has. A visibility predicate is
+   * consulted here and again in handle(), so a hidden tool is never revealed by its headers.
+   */
+  async #check(request: ServerTransportRequest): Promise<void> {
+    const params = request.params ?? {};
+    const stateless = isStateless(params);
+    const headers = headerView(request.headers);
+    checkStandardHeaders(headers, request.method, params, stateless);
+    if (request.method !== 'tools/call' || typeof params.name !== 'string') return;
+    if (stateless) {
+      try { assertProtocol(params); } catch { return; }
+    }
+    const tool = this.#tools.get(params.name);
+    const args = params.arguments ?? {};
+    if (!tool || !isJsonObject(args) || (tool.visible !== undefined && !(await isVisible(tool, request)))) return;
+    checkMirroredHeaders(tool.mirrored, headers, args, stateless && this.#requireHeaders);
   }
 
   /**
@@ -171,7 +206,7 @@ export class Server {
    * issued, so nothing is bound to one. Authentication is the transport's, and
    * the registry, gate, mirrors and result guard are the stateless path's own.
    */
-  async #classic(request: TransportRequest, params: JsonObject): Promise<JsonValue> {
+  async #classic(request: TransportRequest, params: JsonObject, headers: Record<string, string>): Promise<JsonValue> {
     if (request.method.startsWith('notifications/')) return null;
     if (request.method === 'initialize') return initialize(params, this.#instructions);
     const header = request.headers?.['mcp-protocol-version'];
@@ -183,7 +218,7 @@ export class Server {
     if (request.method === 'tools/list') {
       return { tools: (await this.#listed(request)).map(withoutNulls) };
     }
-    if (request.method === 'tools/call') return this.#call(request, params);
+    if (request.method === 'tools/call') return this.#call(request, params, headers, false);
     throw new McpError('protocol_failure', 'Only initialize, ping, tools/list and tools/call are supported.');
   }
 
@@ -195,7 +230,8 @@ export class Server {
     return listed;
   }
 
-  async #call(request: ServerTransportRequest, params: JsonObject): Promise<JsonObject> {
+  async #call(request: ServerTransportRequest, params: JsonObject, headers: Record<string, string>,
+    stateless: boolean): Promise<JsonObject> {
     if (typeof params.name !== 'string' || params.name === '') {
       throw new McpError('protocol_failure', 'tools/call requires a tool name.');
     }
@@ -212,8 +248,8 @@ export class Server {
       throw new McpError('protocol_failure', 'Tool arguments must be an object.');
     }
     const args = cloneObject(params.arguments ?? {});
-    const headers = mirroredHeaders(request.headers ?? {});
-    resolveMirrors(tool.mirrored, headers, args);
+    // Before the gate and the tool: neither may act on a call whose headers say something its body does not.
+    const mirrored = checkMirroredHeaders(tool.mirrored, headers, args, stateless && this.#requireHeaders);
     if (!(await this.#gate(this.options.server, tool.definition.name, args))) {
       throw new McpError('tool_denied', 'The gate refused this tool call.');
     }
@@ -221,7 +257,7 @@ export class Server {
     let result: McpToolResult;
     if (request.signal?.aborted) throw new McpError('tool_call_failed', 'The request was cancelled.');
     try {
-      result = await tool.handler(args, { server: this.options.server, tool: tool.definition.name, headers,
+      result = await tool.handler(args, { server: this.options.server, tool: tool.definition.name, headers: mirrored,
         ...(request.signal === undefined ? {} : { signal: request.signal }),
         ...(request.progress === undefined ? {} : { progress: (message: string, progress?: number, total?: number): void => {
           try { request.progress?.(message, progress, total); } catch { /* Transport progress cannot fail a tool. */ }
@@ -259,6 +295,14 @@ async function isVisible(tool: RegisteredTool, request: TransportRequest): Promi
   } catch {
     return false;
   }
+}
+
+/**
+ * A request carrying ANY stateless metadata key is a stateless request and is held to the stateless rules; only one
+ * with none of them is classic. A half-formed stateless request must not fall through to the classic path.
+ */
+function isStateless(params: JsonObject): boolean {
+  return isJsonObject(params._meta) && STATELESS_KEYS.some((key) => Object.hasOwn(params._meta as JsonObject, key));
 }
 
 function assertProtocol(params: JsonObject): void {
@@ -335,56 +379,10 @@ function payloadOf(tool: ToolDefinition): JsonObject {
     inputSchema: tool.inputSchema, title: tool.title, annotations: tool.annotations });
 }
 
-function mirroredHeaders(raw: Record<string, string>): Record<string, string> {
-  const headers: Record<string, string> = Object.create(null) as Record<string, string>;
-  for (const [name, value] of Object.entries(raw)) {
-    if (!name.toLowerCase().startsWith(PREFIX)) continue;
-    const key = name.slice(PREFIX.length).toLowerCase();
-    if (typeof value !== 'string' || Object.hasOwn(headers, key)) {
-      throw new McpError('protocol_failure', 'Mirrored headers must have unambiguous string values.');
-    }
-    headers[key] = value;
-  }
-  // Never pass Authorization, Cookie, Origin or any other unnamespaced header.
-  return headers;
-}
-
-function resolveMirrors(mirrored: MirroredParameters, headers: Record<string, string>, args: JsonObject): void {
-  for (const [name, { path, type }] of Object.entries(mirrored.parameters)) {
-    const raw = headers[name.toLowerCase()];
-    if (raw === undefined) continue;
-    let value: JsonValue = raw;
-    if (type === 'boolean') {
-      if (raw !== 'true' && raw !== 'false') throw new McpError('protocol_failure', 'Invalid mirrored boolean.');
-      value = raw === 'true';
-    } else if (type === 'integer') {
-      if (!/^-?(0|[1-9][0-9]*)$/.test(raw) || !Number.isSafeInteger(Number(raw))) {
-        throw new McpError('protocol_failure', 'Invalid mirrored integer.');
-      }
-      value = Number(raw);
-    }
-    let target = args;
-    for (const segment of path.slice(0, -1)) {
-      if (!Object.hasOwn(target, segment)) defineOwn(target, segment, {});
-      const nested = target[segment];
-      if (!isJsonObject(nested)) throw new McpError('protocol_failure', 'Mirrored path conflicts with tool arguments.');
-      target = nested;
-    }
-    const leaf = path[path.length - 1];
-    if (Object.hasOwn(target, leaf) && target[leaf] !== value) {
-      throw new McpError('protocol_failure', 'Mirrored header conflicts with tool arguments.');
-    }
-    // Schema property names such as __proto__ are data, never prototype setters.
-    defineOwn(target, leaf, value);
-  }
-}
-
-function defineOwn(target: JsonObject, key: string, value: JsonValue): void {
-  Object.defineProperty(target, key, { value, enumerable: true, writable: true, configurable: true });
-}
-
 /** In-process test/embedder transport. No socket, HTTP authentication or timers. */
 export class InMemoryTransport implements ServerTransport {
+  /** In process there are no HTTP headers to require; any that a request does carry are still checked. */
+  readonly requiresMirroredHeaders = false;
   #handler?: (request: TransportRequest) => Promise<JsonValue>;
   #closed = false;
   readonly #pending = new Set<(error: McpError) => void>();

@@ -6,7 +6,7 @@ import {
   ToolDefinition as ClientToolDefinition, ResultGuard as ClientResultGuard, TrustPolicy,
 } from '@particle-academy/prism-mcp';
 import {
-  Server, InMemoryTransport, ToolDefinition, ResultGuard, McpError, TrustPolicy as ServerTrustPolicy,
+  Server, InMemoryTransport, ToolDefinition, ResultGuard, McpError, TrustPolicy as ServerTrustPolicy, HeaderMismatchError,
   type JsonObject, type McpToolResult, type ServerOptions, type ToolHandler, type TransportRequest,
 } from '../src/index.js';
 
@@ -69,7 +69,7 @@ describe('shared definitions and registration', () => {
     first.tools[0].description = 'mutated reply';
     const second = await transport.request(request()) as { tools: JsonObject[] };
     expect(ToolDefinition.fromPayload(second.tools[0]).digest()).toBe(digest);
-    expect(await transport.request(request('tools/call', { name: 'echo' }, { 'Mcp-Param-region': 'east' })))
+    expect(await transport.request(request('tools/call', { name: 'echo', arguments: { region: 'east' } }, { 'Mcp-Param-region': 'east' })))
       .toEqual({ content: [{ type: 'text', text: '{"region":"east"}' }], isError: false, ...RESULT_META });
     await server.close();
   });
@@ -115,7 +115,8 @@ describe('mirrored headers and the credential boundary', () => {
     for (const mirrored of [false, true]) {
       const headers: Record<string, string> = { Authorization: token, Cookie: cookie, Origin: 'https://untrusted.example' };
       if (mirrored) headers[`mCp-PaRaM-${name.toUpperCase()}`] = 'public-mirrored-value';
-      const reply = await transport.request(request('tools/call', { name: 'mirror' }, headers));
+      const reply = await transport.request(request('tools/call',
+        { name: 'mirror', ...(mirrored ? { arguments: { value: 'public-mirrored-value' } } : {}) }, headers));
       const [args, context] = handler.mock.calls[handler.mock.calls.length - 1];
       expect(args).toEqual(mirrored ? { value: 'public-mirrored-value' } : {});
       expect(context).toEqual({ server: 'fixture', tool: 'mirror', headers: mirrored ? { [name]: 'public-mirrored-value' } : {} });
@@ -126,7 +127,7 @@ describe('mirrored headers and the credential boundary', () => {
     }
     await server.close();
   });
-  it('resolves nested primitive values before gating without mutating caller arguments', async () => {
+  it('checks nested primitive values before gating without mutating caller arguments', async () => {
     const gate = vi.fn(() => true);
     const { server, transport } = await setup({ gate });
     server.register(definition('nested', { properties: { options: { type: 'object', properties: {
@@ -134,12 +135,12 @@ describe('mirrored headers and the credential boundary', () => {
       count: { type: 'integer', 'x-mcp-header': 'Count' },
       enabled: { type: 'boolean', 'x-mcp-header': 'Enabled' },
     } } } }), echo);
-    const args = { other: 'untouched' };
+    const args = { other: 'untouched', options: { region: 'east', count: 0, enabled: false } };
     const reply = await transport.request(request('tools/call', { name: 'nested', arguments: args }, {
       'Mcp-Param-Region': 'east', 'MCP-PARAM-COUNT': '0', 'mcp-param-enabled': 'false',
     }));
     expect(gate).toHaveBeenCalledWith('fixture', 'nested', { other: 'untouched', options: { region: 'east', count: 0, enabled: false } });
-    expect(args).toEqual({ other: 'untouched' });
+    expect(args).toEqual({ other: 'untouched', options: { region: 'east', count: 0, enabled: false } });
     expect(reply).toEqual({ content: [{ type: 'text', text: '{"other":"untouched","options":{"region":"east","count":0,"enabled":false}}' }], isError: false, ...RESULT_META });
     await server.close();
   });
@@ -147,8 +148,8 @@ describe('mirrored headers and the credential boundary', () => {
     const { server, transport } = await setup();
     const handler = vi.fn(echo);
     server.register(definition('integer', { properties: { value: { type: 'integer', 'x-mcp-header': 'N' } } }), handler);
-    await expect(transport.request(request('tools/call', { name: 'integer' }, { 'Mcp-Param-N': value })))
-      .rejects.toMatchObject({ code: 'protocol_failure' });
+    await expect(transport.request(request('tools/call', { name: 'integer', arguments: { value: 1 } }, { 'Mcp-Param-N': value })))
+      .rejects.toBeInstanceOf(HeaderMismatchError);
     expect(handler).not.toHaveBeenCalled();
     await server.close();
   });
@@ -168,7 +169,8 @@ describe('mirrored headers and the credential boundary', () => {
     const schema = JSON.parse('{"properties":{"__proto__":{"properties":{"polluted":{"type":"string","x-mcp-header":"safe"}}}}}') as JsonObject;
     const handler = vi.fn(echo);
     server.register(definition('prototype', schema), handler);
-    await transport.request(request('tools/call', { name: 'prototype' }, { 'Mcp-Param-safe': 'data' }));
+    const args = JSON.parse('{"__proto__":{"polluted":"data"}}') as JsonObject;
+    await transport.request(request('tools/call', { name: 'prototype', arguments: args }, { 'Mcp-Param-safe': 'data' }));
     expect(handler.mock.calls[0][0]).toEqual(JSON.parse('{"__proto__":{"polluted":"data"}}'));
     expect(({} as Record<string, unknown>).polluted).toBeUndefined();
     await server.close();
